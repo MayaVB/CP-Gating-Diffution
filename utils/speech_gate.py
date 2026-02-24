@@ -114,6 +114,35 @@ def gate_step_score(step_info: dict, cache: dict) -> float:
     return leakage_num / leakage_den
 
 
+def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> dict:
+    """Return {gate_name: score} for each requested gate at this diffusion step.
+
+    Currently only "leakage" is implemented.  Adding a new gate requires
+    registering it in the if/elif chain below.
+    """
+    scores = {}
+    for gate in gates:
+        if gate == "leakage":
+            scores["leakage"] = gate_step_score(step_info, cache)
+        # future: elif gate == "distortion": scores["distortion"] = ...
+    return scores
+
+
+def combine_gate_scores(scores: dict, method: str = "max") -> float:
+    """Reduce a {gate_name: score} dict to a single scalar.
+
+    method: "max" → worst-gate score (conservative); "mean" → average.
+    """
+    vals = list(scores.values())
+    if not vals:
+        return 0.0
+    if method == "max":
+        return float(max(vals))
+    if method == "mean":
+        return float(sum(vals) / len(vals))
+    raise ValueError(f"Unknown gate_combine method: {method!r}")
+
+
 def compute_gate_score(step_info: dict) -> float:
     """
     Thin wrapper around compute_speech_gate_score for use in both

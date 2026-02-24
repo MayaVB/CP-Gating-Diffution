@@ -1,5 +1,6 @@
 """Gate analysis plots for calibration diagnostics."""
 import os
+import shutil
 from typing import List
 
 import matplotlib
@@ -8,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def plot_gate_statistics(traj_logs: List, out_dir: str) -> None:
+def plot_gate_statistics(traj_logs: List, out_dir: str, enhanced_dir: str = None) -> None:
     """Generate and save three gate calibration diagnostic plots.
 
     Plots written to out_dir:
@@ -81,10 +82,87 @@ def plot_gate_statistics(traj_logs: List, out_dir: str) -> None:
     fig.savefig(os.path.join(out_dir, "quantiles_vs_step.png"), dpi=120)
     plt.close(fig)
 
+    # ── WAV examples and worst-score lists at selected steps ─────────────────
+    _save_step_wav_examples(valid, mat, sel, out_dir, enhanced_dir=enhanced_dir)
+    _save_worst_wavs(valid, mat, sel, out_dir)
+
     print(
         f"Gate plots saved to {out_dir}: "
         "hist_G.png, hist_g_steps.png, quantiles_vs_step.png"
     )
+
+
+def plot_delta_G(delta_vals: List[float], plots_dir: str) -> None:
+    """Histogram of delta_G = G_try0 - G_best over samples that had restarts.
+
+    Positive delta_G = restart improved the leakage score.
+    Saves hist_delta_G.png to plots_dir.
+    """
+    os.makedirs(plots_dir, exist_ok=True)
+    arr = np.array(delta_vals, dtype=np.float64)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(arr, bins=40, color="mediumseagreen", edgecolor="white", linewidth=0.5)
+    ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0, label="no change")
+    ax.axvline(float(np.mean(arr)), color="orange", linestyle="--",
+               linewidth=1.2, label=f"mean = {np.mean(arr):.3f}")
+    ax.set_xlabel("delta_G = G_try0 − G_best  (positive = improvement)")
+    ax.set_ylabel("Count")
+    ax.set_title(f"Restart improvement (n = {len(arr)} samples with restarts)")
+    ax.legend()
+    fig.tight_layout()
+    out = os.path.join(plots_dir, "hist_delta_G.png")
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    print(f"delta_G histogram saved to {out}")
+
+
+def _save_step_wav_examples(valid: List, mat: "np.ndarray", sel: List[int],
+                            out_dir: str, enhanced_dir: str = None) -> None:
+    """For each selected step, copy the trajectory whose g_k is closest to the
+    median at that step.  Files land in out_dir/step_examples/.
+    Skips silently if the source WAV does not exist.
+    """
+    ex_dir = os.path.join(out_dir, "step_examples")
+    os.makedirs(ex_dir, exist_ok=True)
+    wav_root = enhanced_dir if enhanced_dir else out_dir
+    for k in sel:
+        scores_k = mat[:, k]
+        median_val = float(np.median(scores_k))
+        nearest_idx = int(np.argmin(np.abs(scores_k - median_val)))
+        example_id = valid[nearest_idx].example_id or ""
+        src = os.path.join(wav_root, example_id)
+        if not os.path.isfile(src):
+            print(f"gate_plots: WAV not found, skipping step {k} example: {src}")
+            continue
+        # Flatten any subdirectory separators so the filename stays flat
+        flat_stem = example_id.replace(os.sep, "_").replace("/", "_")
+        dst = os.path.join(ex_dir, f"step_{k:03d}_median_{flat_stem}")
+        shutil.copy2(src, dst)
+    print(f"Step WAV examples saved to {ex_dir}/")
+
+
+def _save_worst_wavs(valid: List, mat: "np.ndarray", sel: List[int],
+                     out_dir: str, worst_pct: float = 0.20) -> None:
+    """For each selected step, write a ranked .txt of the worst-scoring
+    trajectories (top worst_pct by g_k).  Files land in out_dir/worst_wavs/.
+
+    Each line: <score TAB filename>  sorted descending (worst first).
+    """
+    worst_dir = os.path.join(out_dir, "worst_wavs")
+    os.makedirs(worst_dir, exist_ok=True)
+    N = mat.shape[0]
+    n_worst = max(1, int(np.ceil(N * worst_pct)))
+    for k in sel:
+        scores_k = mat[:, k]
+        # argsort ascending → take last n_worst, then reverse for descending
+        worst_indices = np.argsort(scores_k)[-n_worst:][::-1]
+        txt_path = os.path.join(worst_dir, f"step_{k:03d}_worst{int(worst_pct * 100)}pct.txt")
+        with open(txt_path, "w") as f:
+            f.write(f"# {n_worst}/{N} worst trajectories at step {k} "
+                    f"(top {worst_pct:.0%} by g_k score, descending)\n")
+            for idx in worst_indices:
+                f.write(f"{scores_k[idx]:.6f}\t{valid[idx].example_id}\n")
+    print(f"Worst-WAV lists ({int(worst_pct * 100)}% per step) saved to {worst_dir}/")
 
 
 def _selected_step_indices(K: int) -> List[int]:

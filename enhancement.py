@@ -51,6 +51,11 @@ if __name__ == '__main__':
     parser.add_argument("--gate_log_every", type=int, default=1, help="Subsample per-step score logging: store every N-th step (default: 1 = every step)")
     parser.add_argument("--gate_plot", action="store_true", help="Save gate diagnostic plots after inference (requires --gate_compute_tau and --gate_enable)")
     parser.add_argument("--gate_alpha", type=float, default=0.1, help="Miscoverage level for conformal calibration; tau is saved to _calib_tau.json when --gate_compute_tau is set")
+    parser.add_argument("--research_dir", type=str, default="research_artifacts", help="Root directory for all gate research outputs (plots, calibration JSON, summaries)")
+    parser.add_argument("--gates", nargs="+", default=["leakage"], help='Gate names to evaluate (default: ["leakage"]); only "leakage" is currently implemented')
+    parser.add_argument("--gate_combine", choices=["max", "mean"], default="max", help='How to combine scores from multiple gates (default: "max")')
+    parser.add_argument("--gate_start_frac", type=float, default=0.0, help="Skip per-step gate scoring for the first gate_start_frac fraction of diffusion steps (0.0 = gate from step 0)")
+    parser.add_argument("--gate_debug_file", type=str, default="", help="If non-empty, print per-step gate debug info only for this filename")
     args = parser.parse_args()
 
     # Backward compatibility: --gate_resample_once maps to --gate_max_tries 2
@@ -59,10 +64,28 @@ if __name__ == '__main__':
         if args.gate_max_tries == 1:
             args.gate_max_tries = 2
 
+    # Research output directories
+    _rd_calib = join(args.research_dir, "calib")
+    _rd_test  = join(args.research_dir, "test")
+    _rd_plots = join(args.research_dir, "plots")
+    # Only create calib/ in calibration mode so test runs stay clean
+    _active_dirs = [_rd_test, _rd_plots]
+    if args.gate_compute_tau:
+        _active_dirs.append(_rd_calib)
+    for _d in _active_dirs:
+        makedirs(_d, exist_ok=True)
+
     # Load score model
     model = ScoreModel.load_from_checkpoint(args.ckpt, map_location=args.device)
     model.t_eps = args.t_eps
     model.eval()
+
+    # args.N = number of reverse diffusion steps (default 30), NOT dataset size.
+    # k_start is clamped to N-1 so at least the final step is always gated.
+    _k_start = min(int(args.gate_start_frac * args.N), args.N - 1)
+    if _k_start > 0:
+        print(f"Late-start gating: first {_k_start}/{args.N} steps skipped "
+              f"(gate_start_frac={args.gate_start_frac})")
 
     # Get list of noisy files
     noisy_files = []
@@ -98,7 +121,8 @@ if __name__ == '__main__':
         gate_traj_logs = []  # List[GateTrajectoryLog], one per example (example_id set on each)
 
     if args.gate_tau_path or args.gate_compute_tau:
-        from utils.speech_gate import gate_step_score, SamplingAborted
+        from utils.speech_gate import (gate_step_score, SamplingAborted,
+                                       compute_gate_scores_per_step, combine_gate_scores)
 
     if args.gate_tau_path:
         from utils.conformal_calib import load_calibration_json
@@ -163,6 +187,7 @@ if __name__ == '__main__':
         if args.gate_tau_path:
             # Per-step running-max rejection with restarts
             _num_restarts = 0
+            _try0_running_max = None        # running_max of attempt 0 (for delta_G)
             _first_reject_step = None
             _final_running_max = -float("inf")
             for _attempt in range(args.gate_max_restarts + 1):
@@ -171,34 +196,33 @@ if __name__ == '__main__':
                 _attempt_g_steps = []           # per-step buffer; discarded on abort
                 def _step_cb(_si, _rm=_running_max, _tau=_gate_tau_loaded, _il=_is_last,
                              _cache=_gate_cache, _buf=_attempt_g_steps):
-                    g_k = gate_step_score(_si, _cache)
+                    if _si["step_idx"] < _k_start:   # late-start: skip early steps
+                        return
+                    g_k = combine_gate_scores(
+                        compute_gate_scores_per_step(_si, _cache, args.gates),
+                        args.gate_combine,
+                    )
+                    if args.gate_debug_file and filename == args.gate_debug_file:
+                        print(f"[gate_debug] attempt={_attempt} step={_si['step_idx']:3d} "
+                              f"g_k={g_k:.4f} rm={_rm[0]:.4f} tau={_tau:.4f}")
                     _rm[0] = max(_rm[0], g_k)
-                    # DEBUG: per-step trace for one file
-                    if filename == "p257_019.wav":
-                        reject_flag = (not _il) and (_rm[0] > _tau)
-                        print(f"  [DBG step] k={_si['step_idx']:3d}  g_k={g_k:.4f}  "
-                              f"run_max={_rm[0]:.4f}  tau={_tau:.4f}  reject={reject_flag}")
                     if args.gate_compute_tau and _si["step_idx"] % args.gate_log_every == 0:
                         _buf.append(g_k)
                     if not _il and _rm[0] > _tau:
                         raise SamplingAborted(_si["step_idx"], _rm[0])
                 _set_seeds(args.gate_seed + _attempt)
-                if filename == "p257_019.wav":
-                    print(f"[DBG restart] attempt={_attempt}  is_last={_is_last}  "
-                          f"num_restarts_so_far={_num_restarts}")
                 try:
                     sample, _ = _build_sampler(step_callback=_step_cb)()
                 except SamplingAborted as _exc:
                     _num_restarts += 1
                     if _first_reject_step is None:
                         _first_reject_step = _exc.step_idx
-                    # DEBUG: restart event
-                    if filename == "p257_019.wav":
-                        print(f"[DBG restart] ABORTED at step={_exc.step_idx}  "
-                              f"run_max={_exc.running_max:.4f} > tau={_gate_tau_loaded:.4f}  "
-                              f"→ attempt {_attempt} -> {_attempt+1}")
+                    if _attempt == 0:
+                        _try0_running_max = _exc.running_max
                     continue
-                _accepted_g_steps = _attempt_g_steps  # commit accepted attempt's buffer
+                if _attempt == 0:
+                    _try0_running_max = _running_max[0]  # attempt 0 completed cleanly
+                _accepted_g_steps = _attempt_g_steps     # commit accepted attempt's buffer
                 _final_running_max = _running_max[0]
                 break
         else:
@@ -208,13 +232,19 @@ if __name__ == '__main__':
                 # Calibration-only pass: collect per-step scores, no gate decisions.
                 _attempt_g_steps = []
                 def _step_cb_cal(_si, _cache=_gate_cache, _buf=_attempt_g_steps):
+                    if _si["step_idx"] < _k_start:   # late-start: skip early steps
+                        return
                     if _si["step_idx"] % args.gate_log_every == 0:
-                        _buf.append(gate_step_score(_si, _cache))
+                        _buf.append(combine_gate_scores(
+                            compute_gate_scores_per_step(_si, _cache, args.gates),
+                            args.gate_combine,
+                        ))
                 sample, _ = _build_sampler(step_callback=_step_cb_cal)()
                 _accepted_g_steps = _attempt_g_steps
             else:
                 sample, _ = _build_sampler()()
             _num_restarts = 0
+            _try0_running_max = None
             _first_reject_step = None
             _final_running_max = None
         
@@ -299,6 +329,11 @@ if __name__ == '__main__':
             else:
                 _gate_passed = ""
 
+            _delta_G = (
+                round(_try0_running_max - _final_running_max, 6)
+                if (_try0_running_max is not None and _final_running_max is not None)
+                else ""
+            )
             gate_log.append({
                 "filename": filename,
                 "s0": round(s0, 6),
@@ -310,6 +345,8 @@ if __name__ == '__main__':
                 "first_reject_step": _first_reject_step if _first_reject_step is not None else "",
                 "final_running_max": round(_final_running_max, 6) if _final_running_max is not None else "",
                 "gate_passed": _gate_passed,
+                "G_try0": round(_try0_running_max, 6) if _try0_running_max is not None else "",
+                "delta_G": _delta_G,
             })
 
         if args.gate_calibration:
@@ -326,9 +363,10 @@ if __name__ == '__main__':
             score = compute_speech_gate_score(y_np, x_hat_np, speech_mask)
             gate_scores.append(score)
 
-        # Write enhanced wav file
-        makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
-        write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
+        # Write enhanced wav file (skip in calibration mode — we only need gate scores)
+        if not args.gate_compute_tau:
+            makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
+            write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
 
     if args.gate_enable:
         trigger_rate = gate_triggered / gate_total if gate_total > 0 else 0.0
@@ -343,25 +381,53 @@ if __name__ == '__main__':
         print(f"Maxed out:        {gate_maxed_out}  ({maxed_rate:.1%} of triggered)")
         print(f"Replaced:         {gate_replaced}  ({replaced_rate:.1%})")
         print(f"Avg tries used:   {avg_tries:.2f}")
-        log_path = join(args.enhanced_dir, "_gate_log.csv")
+        _csv_dir = _rd_calib if args.gate_compute_tau else _rd_test
+        log_path = join(_csv_dir, "_gate_log.csv")
         with open(log_path, "w", newline="") as _f:
-            _writer = csv.DictWriter(_f, fieldnames=["filename", "s0", "tries_used", "accepted_early", "best_score", "best_try_idx", "num_restarts", "first_reject_step", "final_running_max", "gate_passed"])
+            _writer = csv.DictWriter(_f, fieldnames=[
+                "filename", "s0", "tries_used", "accepted_early", "best_score",
+                "best_try_idx", "num_restarts", "first_reject_step",
+                "final_running_max", "gate_passed", "G_try0", "delta_G",
+            ])
             _writer.writeheader()
             _writer.writerows(gate_log)
         print(f"Gate log saved to {log_path}")
         if args.gate_compute_tau and args.gate_plot:
             from utils.gate_plots import plot_gate_statistics
-            plot_gate_statistics(gate_traj_logs, args.enhanced_dir)
+            plot_gate_statistics(gate_traj_logs, _rd_plots, enhanced_dir=args.enhanced_dir)
         if args.gate_compute_tau:
             from utils.conformal_calib import calibrate_tau_alpha, save_calibration_json
             _calib = calibrate_tau_alpha(gate_traj_logs, args.gate_alpha)
-            _tau_out = join(args.enhanced_dir, "_calib_tau.json")
+            _tau_out = join(_rd_calib, "_calib_tau.json")
             save_calibration_json(_tau_out, _calib, gate_name="leakage_gate",
-                                  extra_meta={"gate_alpha": args.gate_alpha})
+                                  extra_meta={"gate_alpha": args.gate_alpha,
+                                              "gate_start_frac": args.gate_start_frac,
+                                              "gates": args.gates})
             print(f"\n--- Conformal Calibration (G = max_k g_k) ---")
             print(f"alpha = {args.gate_alpha}  →  tau = {_calib['tau']:.4f}")
             print(f"n = {_calib['n']}  G_mean = {_calib['G_mean']:.4f}  G_std = {_calib['G_std']:.4f}")
             print(f"Saved to {_tau_out}")
+        # Restart improvement diagnostics (written for test runs with per-step gate)
+        if args.gate_tau_path:
+            from utils.gate_plots import plot_delta_G
+            _rows_with_restarts = [r for r in gate_log if r["num_restarts"] > 0]
+            _n_restarted = len(_rows_with_restarts)
+            _frac_restarted = _n_restarted / len(gate_log) if gate_log else 0.0
+            _delta_vals = [r["delta_G"] for r in _rows_with_restarts if r["delta_G"] != ""]
+            _mean_dG  = float(np.mean(_delta_vals))  if _delta_vals else float("nan")
+            _med_dG   = float(np.median(_delta_vals)) if _delta_vals else float("nan")
+            _summary_path = join(_rd_test, "restart_summary.txt")
+            with open(_summary_path, "w") as _sf:
+                _sf.write("=== Restart Improvement Summary ===\n")
+                _sf.write(f"Total samples:          {len(gate_log)}\n")
+                _sf.write(f"Samples with restarts:  {_n_restarted}  ({_frac_restarted:.1%})\n")
+                _sf.write(f"delta_G = G_try0 - G_best  (positive = improvement)\n")
+                _sf.write(f"  mean delta_G:   {_mean_dG:.4f}\n")
+                _sf.write(f"  median delta_G: {_med_dG:.4f}\n")
+                _sf.write(f"  n with delta_G: {len(_delta_vals)}\n")
+            print(f"Restart summary saved to {_summary_path}")
+            if _delta_vals:
+                plot_delta_G(_delta_vals, _rd_plots)
 
     if args.gate_calibration:
         gate_scores = np.array(gate_scores)
