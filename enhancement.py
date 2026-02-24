@@ -51,7 +51,6 @@ if __name__ == '__main__':
     parser.add_argument("--gate_log_every", type=int, default=1, help="Subsample per-step score logging: store every N-th step (default: 1 = every step)")
     parser.add_argument("--gate_plot", action="store_true", help="Save gate diagnostic plots after inference (requires --gate_compute_tau and --gate_enable)")
     parser.add_argument("--gate_alpha", type=float, default=0.1, help="Miscoverage level for conformal calibration; tau is saved to _calib_tau.json when --gate_compute_tau is set")
-    parser.add_argument("--research_dir", type=str, default="research_artifacts", help="Root directory for all gate research outputs (plots, calibration JSON, summaries)")
     parser.add_argument("--gates", nargs="+", default=["leakage"], help='Gate names to evaluate (default: ["leakage"]); only "leakage" is currently implemented')
     parser.add_argument("--gate_combine", choices=["max", "mean"], default="max", help='How to combine scores from multiple gates (default: "max")')
     parser.add_argument("--gate_start_frac", type=float, default=0.0, help="Skip per-step gate scoring for the first gate_start_frac fraction of diffusion steps (0.0 = gate from step 0)")
@@ -64,10 +63,10 @@ if __name__ == '__main__':
         if args.gate_max_tries == 1:
             args.gate_max_tries = 2
 
-    # Research output directories
-    _rd_calib = join(args.research_dir, "calib")
-    _rd_test  = join(args.research_dir, "test")
-    _rd_plots = join(args.research_dir, "plots")
+    # Research output directories (rooted under enhanced_dir)
+    _rd_calib = join(args.enhanced_dir, "calib")
+    _rd_test  = join(args.enhanced_dir, "test")
+    _rd_plots = join(args.enhanced_dir, "plots")
     # Only create calib/ in calibration mode so test runs stay clean
     _active_dirs = [_rd_test, _rd_plots]
     if args.gate_compute_tau:
