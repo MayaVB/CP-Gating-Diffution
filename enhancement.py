@@ -26,6 +26,23 @@ def _set_seeds(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def _get_rng_state():
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _set_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--test_dir", type=str, required=True, help='Directory containing the test data')
@@ -39,29 +56,18 @@ if __name__ == '__main__':
     parser.add_argument("--device", type=str, default="cuda", help="Device to use for inference")
     parser.add_argument("--t_eps", type=float, default=0.03, help="The minimum process time (0.03 by default)")
     parser.add_argument("--gate_calibration", action="store_true", help="Collect speech gate scores for calibration")
-    parser.add_argument("--gate_enable", action="store_true", help="Enable speech quality gate")
-    parser.add_argument("--gate_tau", type=float, default=-0.2072, help="Gate threshold: trigger resample if score > tau")
     parser.add_argument("--gate_seed", type=int, default=0, help="Base random seed for reproducible gated sampling")
-    parser.add_argument("--gate_resample_once", action="store_true", help="[Deprecated] Use --gate_max_tries 2 instead")
-    parser.add_argument("--gate_max_tries", type=int, default=1, help="Max sampling attempts per utterance (K=1: no retries, K>1: retry if triggered)")
-    parser.add_argument("--gate_early_stop", action="store_true", help="Stop retrying as soon as a sample passes tau; otherwise always do K tries")
     parser.add_argument("--gate_tau_path", type=str, default=None, help="Path to _calib_tau.json; enables per-step running-max rejection + restart")
     parser.add_argument("--gate_max_restarts", type=int, default=10, help="Max restarts per utterance when per-step gate triggers (used with --gate_tau_path)")
     parser.add_argument("--gate_compute_tau", action="store_true", help="Log per-step scores so G = max_k g_k; enables conformal tau calibration from gate_traj_logs")
     parser.add_argument("--gate_log_every", type=int, default=1, help="Subsample per-step score logging: store every N-th step (default: 1 = every step)")
-    parser.add_argument("--gate_plot", action="store_true", help="Save gate diagnostic plots after inference (requires --gate_compute_tau and --gate_enable)")
+    parser.add_argument("--gate_plot", action="store_true", help="Save gate diagnostic plots after inference (requires --gate_compute_tau)")
     parser.add_argument("--gate_alpha", type=float, default=0.1, help="Miscoverage level for conformal calibration; tau is saved to _calib_tau.json when --gate_compute_tau is set")
     parser.add_argument("--gates", nargs="+", default=["leakage"], help='Gate names to evaluate (default: ["leakage"]); only "leakage" is currently implemented')
     parser.add_argument("--gate_combine", choices=["max", "mean"], default="max", help='How to combine scores from multiple gates (default: "max")')
     parser.add_argument("--gate_start_frac", type=float, default=0.0, help="Skip per-step gate scoring for the first gate_start_frac fraction of diffusion steps (0.0 = gate from step 0)")
     parser.add_argument("--gate_debug_file", type=str, default="", help="If non-empty, print per-step gate debug info only for this filename")
     args = parser.parse_args()
-
-    # Backward compatibility: --gate_resample_once maps to --gate_max_tries 2
-    if args.gate_resample_once:
-        print("Warning: --gate_resample_once is deprecated. Use --gate_max_tries 2 instead.")
-        if args.gate_max_tries == 1:
-            args.gate_max_tries = 2
 
     # Research output directories (rooted under enhanced_dir)
     _rd_calib = join(args.enhanced_dir, "calib")
@@ -108,19 +114,13 @@ if __name__ == '__main__':
         from utils.speech_gate import compute_speech_gate_score
         gate_scores = []
 
-    if args.gate_enable:
+    if args.gate_compute_tau or args.gate_tau_path:
         from utils.speech_gate import compute_speech_gate_score, GateTrajectoryLog
-        gate_total = 0
-        gate_triggered = 0
-        gate_accepted_early = 0
-        gate_maxed_out = 0
-        gate_replaced = 0
-        gate_tries_total = 0
         gate_log = []
-        gate_traj_logs = []  # List[GateTrajectoryLog], one per example (example_id set on each)
+        gate_traj_logs = []  # List[GateTrajectoryLog], one per example; used by gate_compute_tau
 
     if args.gate_tau_path or args.gate_compute_tau:
-        from utils.speech_gate import (gate_step_score, SamplingAborted,
+        from utils.speech_gate import (SamplingAborted,
                                        compute_gate_scores_per_step, combine_gate_scores)
 
     if args.gate_tau_path:
@@ -130,6 +130,15 @@ if __name__ == '__main__':
         print(f"Per-step gate: tau={_gate_tau_loaded:.4f}  "
               f"alpha={_calib.get('alpha', '?')}  "
               f"(from {args.gate_tau_path})")
+
+    # DNSMOS availability (test mode only; graceful no-op if speechmos missing)
+    _dnsmos_available = False
+    if args.gate_tau_path:
+        from utils.dnsmos_helper import is_available as _dnsmos_is_available, compute_dnsmos
+        _dnsmos_available = _dnsmos_is_available()
+        if not _dnsmos_available:
+            print("Warning: speechmos not found; DNSMOS columns will be blank. "
+                  "Install with: pip install speechmos")
 
     # Enhance files
     for noisy_file in tqdm(noisy_files):
@@ -187,6 +196,7 @@ if __name__ == '__main__':
             # Per-step running-max rejection with restarts
             _num_restarts = 0
             _try0_running_max = None        # running_max of attempt 0 (for delta_G)
+            _try0_rng_state   = None        # exact RNG snapshot before attempt 0
             _first_reject_step = None
             _final_running_max = -float("inf")
             for _attempt in range(args.gate_max_restarts + 1):
@@ -210,6 +220,8 @@ if __name__ == '__main__':
                     if not _il and _rm[0] > _tau:
                         raise SamplingAborted(_si["step_idx"], _rm[0])
                 _set_seeds(args.gate_seed + _attempt)
+                if _attempt == 0 and _dnsmos_available:
+                    _try0_rng_state = _get_rng_state()  # snapshot exact state for try0 replay
                 try:
                     sample, _ = _build_sampler(step_callback=_step_cb)()
                 except SamplingAborted as _exc:
@@ -225,8 +237,6 @@ if __name__ == '__main__':
                 _final_running_max = _running_max[0]
                 break
         else:
-            if args.gate_enable:
-                _set_seeds(args.gate_seed)
             if args.gate_compute_tau:
                 # Calibration-only pass: collect per-step scores, no gate decisions.
                 _attempt_g_steps = []
@@ -253,100 +263,66 @@ if __name__ == '__main__':
         # Renormalize
         x_hat = x_hat * norm_factor
 
-        if args.gate_enable:
+        if args.gate_compute_tau or args.gate_tau_path:
             y_np = y.squeeze().cpu().numpy()
 
             # Energy-based VAD (same as calibration)
             _energy = np.convolve(y_np ** 2, np.ones(400) / 400, mode='same')
             speech_mask = _energy > np.percentile(_energy, 80)
 
-            # One trajectory log for this entire example (all attempts)
-            traj_log = GateTrajectoryLog(gate_name="leakage_gate", example_id=filename)
-
             s0 = compute_speech_gate_score(y_np, (x_hat / norm_factor).cpu().numpy(), speech_mask)
-            gate_total += 1
-            traj_log.log_final(s0, attempt_idx=0)
 
-            best_score = s0
-            best_x_hat = x_hat
-            best_try_idx = 0
-            tries_used = 1
-            triggered = s0 > args.gate_tau
-            accepted_early = False
-
-            if triggered:
-                gate_triggered += 1
-                for i in range(1, args.gate_max_tries):
-                    _set_seeds(args.gate_seed + i)
-                    sample_i, _ = _build_sampler()()
-                    x_hat_i = model.to_audio(sample_i.squeeze(), T_orig)
-                    x_hat_i = x_hat_i * norm_factor
-                    s_i = compute_speech_gate_score(y_np, (x_hat_i / norm_factor).cpu().numpy(), speech_mask)
-                    tries_used += 1
-                    traj_log.log_final(s_i, attempt_idx=i)
-
-                    if s_i < best_score:
-                        best_score = s_i
-                        best_x_hat = x_hat_i
-                        best_try_idx = i
-
-                    if args.gate_early_stop and s_i <= args.gate_tau:
-                        accepted_early = True
-                        gate_accepted_early += 1
-                        break
-
-                if not accepted_early:
-                    gate_maxed_out += 1
-
-                x_hat = best_x_hat
-
-            # In per-step mode the restart loop owns tries; sync so CSV is consistent.
-            # best_try_idx is used for the CSV (restart attempt index).
-            # finalize() takes an index into attempt_scores, which has exactly one entry
-            # (s0 at index 0) in per-step mode since the K-tries loop never runs.
-            if args.gate_tau_path:
-                tries_used = 1 + _num_restarts
-                best_try_idx = _num_restarts   # accepted attempt index (0-based), for CSV
-            _finalize_idx = 0 if args.gate_tau_path else best_try_idx
-
-            # Finalize trajectory log: G = score of the kept attempt
-            traj_log.finalize(_finalize_idx)
-            # Commit per-step scores from the accepted attempt so trajectory_score = max_k g_k
             if args.gate_compute_tau:
+                # Trajectory log: records per-step scores for conformal calibration
+                traj_log = GateTrajectoryLog(gate_name="leakage_gate", example_id=filename)
+                traj_log.log_final(s0, attempt_idx=0)
+                traj_log.finalize(0)
                 for _gs in _accepted_g_steps:
                     traj_log.log_step(_gs)
-            gate_traj_logs.append(traj_log)
+                gate_traj_logs.append(traj_log)
 
-            if best_try_idx != 0:
-                gate_replaced += 1
-            gate_tries_total += tries_used
+            if args.gate_tau_path:
+                # gate_passed: True  → accepted attempt satisfied tau (clean accept)
+                #              False → all restarts exhausted, last attempt forced (may exceed tau)
+                _gate_passed = int(_final_running_max <= _gate_tau_loaded) if _final_running_max is not None else ""
 
-            # gate_passed: True  → accepted attempt satisfied tau (clean accept)
-            #              False → all restarts exhausted, last attempt forced (may exceed tau)
-            if args.gate_tau_path and _final_running_max is not None:
-                _gate_passed = int(_final_running_max <= _gate_tau_loaded)
-            else:
-                _gate_passed = ""
+                _delta_G = (
+                    round(_try0_running_max - _final_running_max, 6)
+                    if (_try0_running_max is not None and _final_running_max is not None)
+                    else ""
+                )
+                # DNSMOS evaluation (one inference pass per file)
+                _dnsmos_best = _dnsmos_try0 = _delta_dnsmos = ""
+                if _dnsmos_available:
+                    _best_val = compute_dnsmos(x_hat.cpu().numpy(), target_sr)
+                    if _num_restarts == 0:
+                        _try0_val = _best_val      # no restarts: try0 == best
+                    else:
+                        # attempt 0 was aborted; replay exact RNG state → identical trajectory
+                        _set_rng_state(_try0_rng_state)
+                        _s_try0, _ = _build_sampler()()   # no callback → runs to completion
+                        _xh_try0 = model.to_audio(_s_try0.squeeze(), T_orig) * norm_factor
+                        _try0_val = compute_dnsmos(_xh_try0.cpu().numpy(), target_sr)
+                    if _best_val is not None:
+                        _dnsmos_best = round(float(_best_val), 4)
+                    if _try0_val is not None:
+                        _dnsmos_try0 = round(float(_try0_val), 4)
+                    if _dnsmos_best != "" and _dnsmos_try0 != "":
+                        _delta_dnsmos = round(float(_best_val) - float(_try0_val), 4)
 
-            _delta_G = (
-                round(_try0_running_max - _final_running_max, 6)
-                if (_try0_running_max is not None and _final_running_max is not None)
-                else ""
-            )
-            gate_log.append({
-                "filename": filename,
-                "s0": round(s0, 6),
-                "tries_used": tries_used,
-                "accepted_early": int(accepted_early),
-                "best_score": round(best_score, 6),
-                "best_try_idx": best_try_idx,
-                "num_restarts": _num_restarts,
-                "first_reject_step": _first_reject_step if _first_reject_step is not None else "",
-                "final_running_max": round(_final_running_max, 6) if _final_running_max is not None else "",
-                "gate_passed": _gate_passed,
-                "G_try0": round(_try0_running_max, 6) if _try0_running_max is not None else "",
-                "delta_G": _delta_G,
-            })
+                gate_log.append({
+                    "filename": filename,
+                    "s0": round(s0, 6),
+                    "num_restarts": _num_restarts,
+                    "first_reject_step": _first_reject_step if _first_reject_step is not None else "",
+                    "final_running_max": round(_final_running_max, 6) if _final_running_max is not None else "",
+                    "gate_passed": _gate_passed,
+                    "G_try0": round(_try0_running_max, 6) if _try0_running_max is not None else "",
+                    "delta_G": _delta_G,
+                    "DNSMOS_try0": _dnsmos_try0,
+                    "DNSMOS_best": _dnsmos_best,
+                    "delta_DNSMOS": _delta_dnsmos,
+                })
 
         if args.gate_calibration:
             # Use normalized versions of both signals so the ratio is meaningful
@@ -367,66 +343,102 @@ if __name__ == '__main__':
             makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
             write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
 
-    if args.gate_enable:
-        trigger_rate = gate_triggered / gate_total if gate_total > 0 else 0.0
-        replaced_rate = gate_replaced / gate_total if gate_total > 0 else 0.0
-        early_rate = gate_accepted_early / gate_triggered if gate_triggered > 0 else 0.0
-        maxed_rate = gate_maxed_out / gate_triggered if gate_triggered > 0 else 0.0
-        avg_tries = gate_tries_total / gate_total if gate_total > 0 else 0.0
-        print("\n--- Speech Gate Summary ---")
-        print(f"Total:            {gate_total}")
-        print(f"Triggered:        {gate_triggered}  ({trigger_rate:.1%})")
-        print(f"Accepted early:   {gate_accepted_early}  ({early_rate:.1%} of triggered)")
-        print(f"Maxed out:        {gate_maxed_out}  ({maxed_rate:.1%} of triggered)")
-        print(f"Replaced:         {gate_replaced}  ({replaced_rate:.1%})")
-        print(f"Avg tries used:   {avg_tries:.2f}")
-        _csv_dir = _rd_calib if args.gate_compute_tau else _rd_test
-        log_path = join(_csv_dir, "_gate_log.csv")
+    if args.gate_compute_tau:
+        if args.gate_plot:
+            from utils.gate_plots import plot_gate_statistics
+            plot_gate_statistics(gate_traj_logs, _rd_plots, enhanced_dir=args.enhanced_dir)
+        from utils.conformal_calib import calibrate_tau_alpha, save_calibration_json
+        _calib = calibrate_tau_alpha(gate_traj_logs, args.gate_alpha)
+        _tau_out = join(_rd_calib, "_calib_tau.json")
+        save_calibration_json(_tau_out, _calib, gate_name="leakage_gate",
+                              extra_meta={"gate_alpha": args.gate_alpha,
+                                          "gate_start_frac": args.gate_start_frac,
+                                          "gates": args.gates})
+        print(f"\n--- Conformal Calibration (G = max_k g_k) ---")
+        print(f"alpha = {args.gate_alpha}  →  tau = {_calib['tau']:.4f}")
+        print(f"n = {_calib['n']}  G_mean = {_calib['G_mean']:.4f}  G_std = {_calib['G_std']:.4f}")
+        print(f"Saved to {_tau_out}")
+
+    if args.gate_tau_path:
+        log_path = join(_rd_test, "_gate_log.csv")
         with open(log_path, "w", newline="") as _f:
             _writer = csv.DictWriter(_f, fieldnames=[
-                "filename", "s0", "tries_used", "accepted_early", "best_score",
-                "best_try_idx", "num_restarts", "first_reject_step",
+                "filename", "s0", "num_restarts", "first_reject_step",
                 "final_running_max", "gate_passed", "G_try0", "delta_G",
+                "DNSMOS_try0", "DNSMOS_best", "delta_DNSMOS",
             ])
             _writer.writeheader()
             _writer.writerows(gate_log)
         print(f"Gate log saved to {log_path}")
-        if args.gate_compute_tau and args.gate_plot:
-            from utils.gate_plots import plot_gate_statistics
-            plot_gate_statistics(gate_traj_logs, _rd_plots, enhanced_dir=args.enhanced_dir)
-        if args.gate_compute_tau:
-            from utils.conformal_calib import calibrate_tau_alpha, save_calibration_json
-            _calib = calibrate_tau_alpha(gate_traj_logs, args.gate_alpha)
-            _tau_out = join(_rd_calib, "_calib_tau.json")
-            save_calibration_json(_tau_out, _calib, gate_name="leakage_gate",
-                                  extra_meta={"gate_alpha": args.gate_alpha,
-                                              "gate_start_frac": args.gate_start_frac,
-                                              "gates": args.gates})
-            print(f"\n--- Conformal Calibration (G = max_k g_k) ---")
-            print(f"alpha = {args.gate_alpha}  →  tau = {_calib['tau']:.4f}")
-            print(f"n = {_calib['n']}  G_mean = {_calib['G_mean']:.4f}  G_std = {_calib['G_std']:.4f}")
-            print(f"Saved to {_tau_out}")
-        # Restart improvement diagnostics (written for test runs with per-step gate)
-        if args.gate_tau_path:
-            from utils.gate_plots import plot_delta_G
-            _rows_with_restarts = [r for r in gate_log if r["num_restarts"] > 0]
-            _n_restarted = len(_rows_with_restarts)
-            _frac_restarted = _n_restarted / len(gate_log) if gate_log else 0.0
-            _delta_vals = [r["delta_G"] for r in _rows_with_restarts if r["delta_G"] != ""]
-            _mean_dG  = float(np.mean(_delta_vals))  if _delta_vals else float("nan")
-            _med_dG   = float(np.median(_delta_vals)) if _delta_vals else float("nan")
-            _summary_path = join(_rd_test, "restart_summary.txt")
-            with open(_summary_path, "w") as _sf:
-                _sf.write("=== Restart Improvement Summary ===\n")
-                _sf.write(f"Total samples:          {len(gate_log)}\n")
-                _sf.write(f"Samples with restarts:  {_n_restarted}  ({_frac_restarted:.1%})\n")
-                _sf.write(f"delta_G = G_try0 - G_best  (positive = improvement)\n")
-                _sf.write(f"  mean delta_G:   {_mean_dG:.4f}\n")
-                _sf.write(f"  median delta_G: {_med_dG:.4f}\n")
-                _sf.write(f"  n with delta_G: {len(_delta_vals)}\n")
-            print(f"Restart summary saved to {_summary_path}")
-            if _delta_vals:
-                plot_delta_G(_delta_vals, _rd_plots)
+        # Restart improvement diagnostics
+        from utils.gate_plots import plot_delta_G
+        _rows_with_restarts = [r for r in gate_log if r["num_restarts"] > 0]
+        _n_restarted = len(_rows_with_restarts)
+        _frac_restarted = _n_restarted / len(gate_log) if gate_log else 0.0
+        _delta_vals = [r["delta_G"] for r in _rows_with_restarts if r["delta_G"] != ""]
+        _mean_dG  = float(np.mean(_delta_vals))  if _delta_vals else float("nan")
+        _med_dG   = float(np.median(_delta_vals)) if _delta_vals else float("nan")
+        _summary_path = join(_rd_test, "restart_summary.txt")
+        with open(_summary_path, "w") as _sf:
+            _sf.write("=== Restart Improvement Summary ===\n")
+            _sf.write(f"Total samples:          {len(gate_log)}\n")
+            _sf.write(f"Samples with restarts:  {_n_restarted}  ({_frac_restarted:.1%})\n")
+            _sf.write(f"delta_G = G_try0 - G_final  (positive = improvement)\n")
+            _sf.write(f"  mean delta_G:   {_mean_dG:.4f}\n")
+            _sf.write(f"  median delta_G: {_med_dG:.4f}\n")
+            _sf.write(f"  n with delta_G: {len(_delta_vals)}\n")
+        print(f"Restart summary saved to {_summary_path}")
+        if _delta_vals:
+            plot_delta_G(_delta_vals, _rd_plots)
+        # DNSMOS correlation analysis (only when restarts occurred and DNSMOS is available)
+        if _dnsmos_available and _rows_with_restarts:
+            _corr_rows = [r for r in _rows_with_restarts
+                          if r["delta_DNSMOS"] != "" and r["delta_G"] != ""]
+            if _corr_rows:
+                from scipy import stats
+                from utils.gate_plots import plot_deltaG_vs_deltaDNSMOS
+                _MIN_DG = 0.01   # filter numerical-noise band; only rows with |delta_G| > this
+
+                def _corr_block(rows, label):
+                    """Compute and return (dG_arr, dDNS_arr, pearson_r, spearman_r) or None."""
+                    _filt = [r for r in rows if abs(float(r["delta_G"])) > _MIN_DG]
+                    if len(_filt) < 2:
+                        return None
+                    _dG   = np.array([r["delta_G"]     for r in _filt], dtype=float)
+                    _dDNS = np.array([r["delta_DNSMOS"] for r in _filt], dtype=float)
+                    _pr, _pp = stats.pearsonr(_dG, _dDNS)
+                    _sr, _sp = stats.spearmanr(_dG, _dDNS)
+                    return _dG, _dDNS, _pr, _pp, _sr, _sp, label
+
+                _subsets = [
+                    ("all restarted",      _corr_rows),
+                    ("gate_passed == 1",   [r for r in _corr_rows if r["gate_passed"] == 1]),
+                    ("gate_passed == 0",   [r for r in _corr_rows if r["gate_passed"] == 0]),
+                ]
+                _corr_path = join(_rd_test, "dnsmos_correlation.txt")
+                print(f"\n--- DNSMOS Correlation  (|delta_G| > {_MIN_DG}) ---")
+                with open(_corr_path, "w") as _cf:
+                    _cf.write("=== DNSMOS Correlation with Gate Improvement ===\n")
+                    _cf.write(f"Filter: |delta_G| > {_MIN_DG}\n")
+                    _first_result = None
+                    for _label, _rows in _subsets:
+                        _res = _corr_block(_rows, _label)
+                        if _res is None:
+                            _cf.write(f"\n--- {_label}: too few samples ---\n")
+                            continue
+                        _dG, _dDNS, _pr, _pp, _sr, _sp, _lbl = _res
+                        _cf.write(f"\n--- {_lbl} (n={len(_dG)}) ---\n")
+                        _cf.write(f"  mean delta_G:      {float(np.mean(_dG)):.4f}\n")
+                        _cf.write(f"  mean delta_DNSMOS: {float(np.mean(_dDNS)):.4f}\n")
+                        _cf.write(f"  Pearson  r={_pr:.4f}  p={_pp:.4f}\n")
+                        _cf.write(f"  Spearman r={_sr:.4f}  p={_sp:.4f}\n")
+                        print(f"  {_lbl} (n={len(_dG)}): "
+                              f"Pearson r={_pr:.4f}  Spearman ρ={_sr:.4f}")
+                        if _first_result is None:
+                            _first_result = (_dG, _dDNS)
+                print(f"  Saved to {_corr_path}")
+                if _first_result is not None:
+                    plot_deltaG_vs_deltaDNSMOS(_first_result[0], _first_result[1], _rd_plots)
 
     if args.gate_calibration:
         gate_scores = np.array(gate_scores)

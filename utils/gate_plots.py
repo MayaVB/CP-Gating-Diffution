@@ -93,7 +93,7 @@ def plot_gate_statistics(traj_logs: List, out_dir: str, enhanced_dir: str = None
 
 
 def plot_delta_G(delta_vals: List[float], plots_dir: str) -> None:
-    """Histogram of delta_G = G_try0 - G_best over samples that had restarts.
+    """Histogram of delta_G = G_try0 - G_final over samples that had restarts.
 
     Positive delta_G = restart improved the leakage score.
     Saves hist_delta_G.png to plots_dir.
@@ -105,7 +105,7 @@ def plot_delta_G(delta_vals: List[float], plots_dir: str) -> None:
     ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0, label="no change")
     ax.axvline(float(np.mean(arr)), color="orange", linestyle="--",
                linewidth=1.2, label=f"mean = {np.mean(arr):.3f}")
-    ax.set_xlabel("delta_G = G_try0 − G_best  (positive = improvement)")
+    ax.set_xlabel("delta_G = G_try0 − G_final  (positive = improvement)")
     ax.set_ylabel("Count")
     ax.set_title(f"Restart improvement (n = {len(arr)} samples with restarts)")
     ax.legend()
@@ -114,6 +114,34 @@ def plot_delta_G(delta_vals: List[float], plots_dir: str) -> None:
     fig.savefig(out, dpi=120)
     plt.close(fig)
     print(f"delta_G histogram saved to {out}")
+
+
+def plot_deltaG_vs_deltaDNSMOS(dG: "np.ndarray", dDNS: "np.ndarray",
+                               plots_dir: str) -> None:
+    """Scatter plot of delta_G vs delta_DNSMOS for restarted samples.
+
+    Includes a linear regression line and Pearson r in the title.
+    Saves deltaG_vs_deltaDNSMOS.png to plots_dir.
+    """
+    from scipy import stats
+    os.makedirs(plots_dir, exist_ok=True)
+    slope, intercept, r, _, _ = stats.linregress(dG, dDNS)
+    x_line = np.array([dG.min(), dG.max()])
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.scatter(dG, dDNS, alpha=0.6, s=20, color="steelblue", label="samples")
+    ax.plot(x_line, slope * x_line + intercept, color="firebrick",
+            linewidth=1.5, label=f"fit  r={r:.3f}")
+    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+    ax.axvline(0, color="gray", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("delta_G = G_try0 − G_best  (positive = gate improved)")
+    ax.set_ylabel("delta_DNSMOS = DNSMOS_best − DNSMOS_try0")
+    ax.set_title(f"Gate improvement vs perceptual quality  (n={len(dG)}, Pearson r={r:.3f})")
+    ax.legend()
+    fig.tight_layout()
+    out = os.path.join(plots_dir, "deltaG_vs_deltaDNSMOS.png")
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+    print(f"Scatter plot saved to {out}")
 
 
 def _save_step_wav_examples(valid: List, mat: "np.ndarray", sel: List[int],
