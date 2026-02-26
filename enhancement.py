@@ -1,4 +1,5 @@
 import glob
+import os
 import random
 import csv
 import numpy as np
@@ -67,6 +68,9 @@ if __name__ == '__main__':
     parser.add_argument("--gate_combine", choices=["max", "mean"], default="max", help='How to combine scores from multiple gates (default: "max")')
     parser.add_argument("--gate_start_frac", type=float, default=0.0, help="Skip per-step gate scoring for the first gate_start_frac fraction of diffusion steps (0.0 = gate from step 0)")
     parser.add_argument("--gate_debug_file", type=str, default="", help="If non-empty, print per-step gate debug info only for this filename")
+    parser.add_argument("--file_list", type=str, default=None, help="Optional path to a text file listing filenames (relative to --test_dir) to process; one per line. If omitted, all WAV/FLAC in test_dir are processed.")
+    parser.add_argument("--debug_level", type=int, default=0, help="0=off, 1=enable debug prints and per-step WAV saving")
+    parser.add_argument("--save_step_wavs", action="store_true", help="Save per-step WAV snapshots at steps {0,7,15,22,29} for first 2 test utterances (test mode only)")
     args = parser.parse_args()
 
     # Research output directories (rooted under enhanced_dir)
@@ -139,6 +143,12 @@ if __name__ == '__main__':
         if not _dnsmos_available:
             print("Warning: speechmos not found; DNSMOS columns will be blank. "
                   "Install with: pip install speechmos")
+
+    if args.debug_level > 0:
+        print(f"[DEBUG_GATE_SAVE] enhanced_dir = {args.enhanced_dir}")
+        print(f"[DEBUG_GATE_SAVE] cwd          = {os.getcwd()}")
+        print(f"[DEBUG_GATE_SAVE] gate_compute_tau = {args.gate_compute_tau}")
+        print(f"[DEBUG_GATE_SAVE] WAV save condition (not gate_compute_tau) = {not args.gate_compute_tau}")
 
     # Enhance files
     for noisy_file in tqdm(noisy_files):
@@ -217,6 +227,17 @@ if __name__ == '__main__':
                     _rm[0] = max(_rm[0], g_k)
                     if args.gate_compute_tau and _si["step_idx"] % args.gate_log_every == 0:
                         _buf.append(g_k)
+                    # Per-step WAV saving for test mode (first 2 utterances, target steps)
+                    if args.save_step_wavs and len(gate_log) < 2 and _si["step_idx"] in (0, 7, 15, 22, 29):
+                        k = _si["step_idx"]
+                        _wav_k = (model.to_audio(_si["xt_mean"].squeeze(), T_orig) * norm_factor).cpu().numpy()
+                        _stem = os.path.splitext(os.path.basename(filename))[0]
+                        _step_dir = join(args.enhanced_dir, f"test_step_{k:03d}")
+                        makedirs(_step_dir, exist_ok=True)
+                        _wav_path = join(_step_dir, f"{_stem}_step{k:03d}_g{g_k:.4f}.wav")
+                        write(_wav_path, _wav_k, target_sr)
+                        print(f"[SAVE_STEP_WAV_TEST] idx={len(gate_log)} step={k} "
+                              f"g={g_k:.4f} path={_wav_path}")
                     if not _il and _rm[0] > _tau:
                         raise SamplingAborted(_si["step_idx"], _rm[0])
                 _set_seeds(args.gate_seed + _attempt)
@@ -244,10 +265,38 @@ if __name__ == '__main__':
                     if _si["step_idx"] < _k_start:   # late-start: skip early steps
                         return
                     if _si["step_idx"] % args.gate_log_every == 0:
-                        _buf.append(combine_gate_scores(
+                        g_k = combine_gate_scores(
                             compute_gate_scores_per_step(_si, _cache, args.gates),
                             args.gate_combine,
-                        ))
+                        )
+                        _buf.append(g_k)
+                        # Per-step WAV saving and debug prints (debug_level > 0 only)
+                        if args.debug_level > 0 and _si["step_idx"] in (0, 7, 15, 22, 29):
+                            _intended = join(args.enhanced_dir, f"step_{_si['step_idx']:03d}", filename)
+                            print(f"[DEBUG_GATE_SAVE] step={_si['step_idx']:3d}  g_k={g_k:.6f}  "
+                                  f"intended_path={_intended}")
+                            # Save WAV for first 2 utterances only
+                            if len(gate_traj_logs) < 2:
+                                k = _si["step_idx"]
+                                _wav_k = model.to_audio(_si["xt_mean"].squeeze(), T_orig)
+                                _wav_k = (_wav_k * norm_factor).cpu().numpy()
+                                # Sanity check
+                                _peak = float(np.max(np.abs(_wav_k)))
+                                _rms  = float(np.sqrt(np.mean(_wav_k ** 2)))
+                                _n    = len(_wav_k)
+                                _finite = bool(np.isfinite(_wav_k).all())
+                                print(f"[STEP_WAV_STATS] idx={len(gate_traj_logs)} step={k} "
+                                      f"n={_n} peak={_peak:.4f} rms={_rms:.4f} finite={_finite}")
+                                if not _finite or _peak == 0 or _rms < 1e-6:
+                                    print(f"[STEP_WAV_STATS] WARNING: idx={len(gate_traj_logs)} "
+                                          f"step={k} — audio is {'non-finite' if not _finite else 'silent/zero'}")
+                                _stem = os.path.splitext(os.path.basename(filename))[0]
+                                _step_dir = join(args.enhanced_dir, f"step_{k:03d}")
+                                makedirs(_step_dir, exist_ok=True)
+                                _wav_path = join(_step_dir, f"{_stem}_step{k:03d}_g{g_k:.4f}.wav")
+                                write(_wav_path, _wav_k, target_sr)
+                                print(f"[SAVE_STEP_WAV] idx={len(gate_traj_logs)} step={k} "
+                                      f"g={g_k:.4f} path={_wav_path}")
                 sample, _ = _build_sampler(step_callback=_step_cb_cal)()
                 _accepted_g_steps = _attempt_g_steps
             else:
@@ -340,6 +389,8 @@ if __name__ == '__main__':
 
         # Write enhanced wav file (skip in calibration mode — we only need gate scores)
         if not args.gate_compute_tau:
+            if args.debug_level > 0:
+                print(f"[DEBUG_GATE_SAVE] triggered WAV save → {join(args.enhanced_dir, filename)}")
             makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
             write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
 
