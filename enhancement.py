@@ -97,11 +97,26 @@ if __name__ == '__main__':
               f"(gate_start_frac={args.gate_start_frac})")
 
     # Get list of noisy files
-    noisy_files = []
-    noisy_files += sorted(glob.glob(join(args.test_dir, '*.wav')))
-    noisy_files += sorted(glob.glob(join(args.test_dir, '**', '*.wav')))
-    noisy_files += sorted(glob.glob(join(args.test_dir, '*.flac')))
-    noisy_files += sorted(glob.glob(join(args.test_dir, '**', '*.flac')))
+    if args.file_list is not None:
+        with open(args.file_list) as _fl:
+            _entries = [s for line in _fl if (s := line.strip()) and not s.startswith('#')]
+        noisy_files = []
+        for _rel in _entries:
+            _full = join(args.test_dir, _rel)
+            if not os.path.isfile(_full):
+                print(f"Warning: file_list entry not found, skipping: {_full}")
+            else:
+                noisy_files.append(_full)
+        if not noisy_files:
+            print("Error: no valid files found from --file_list. Exiting.")
+            raise SystemExit(1)
+        print(f"file_list mode: {len(noisy_files)} files to process (from {args.file_list})")
+    else:
+        noisy_files = []
+        noisy_files += sorted(glob.glob(join(args.test_dir, '*.wav')))
+        noisy_files += sorted(glob.glob(join(args.test_dir, '**', '*.wav')))
+        noisy_files += sorted(glob.glob(join(args.test_dir, '*.flac')))
+        noisy_files += sorted(glob.glob(join(args.test_dir, '**', '*.flac')))
 
     # Check if the model is trained on 48 kHz data
     if model.backbone == 'ncsnpp_48k':
