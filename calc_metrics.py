@@ -1,3 +1,4 @@
+import os
 from os.path import join
 from glob import glob
 from argparse import ArgumentParser
@@ -30,13 +31,16 @@ if __name__ == '__main__':
     noisy_files += sorted(glob(join(args.noisy_dir, '**', '*.wav')))
     for noisy_file in tqdm(noisy_files):
         filename = noisy_file.replace(args.noisy_dir, "")[1:]
+        enh_path = join(args.enhanced_dir, filename)
+        if not os.path.isfile(enh_path):
+            continue  # subset run: only score files that were actually enhanced
         if 'dB' in filename:
             clean_filename = filename.split("_")[0] + ".wav"
         else:
             clean_filename = filename
         x, sr_x = read(join(args.clean_dir, clean_filename))
         y, sr_y = read(join(args.noisy_dir, filename))
-        x_hat, sr_x_hat = read(join(args.enhanced_dir, filename))
+        x_hat, sr_x_hat = read(enh_path)
         assert sr_x == sr_y == sr_x_hat
         n = y - x 
         x_hat_16k = librosa.resample(x_hat, orig_sr=sr_x_hat, target_sr=16000) if sr_x_hat != 16000 else x_hat
