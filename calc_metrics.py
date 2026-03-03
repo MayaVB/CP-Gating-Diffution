@@ -15,6 +15,26 @@ from pystoi import stoi
 from sgmse.util.other import energy_ratios, mean_std
 
 
+def sisdr(est: np.ndarray, ref: np.ndarray) -> float:
+    """Scale-invariant SDR (dB): SI-SDR(est, ref).
+
+    Projects est onto ref to obtain the target signal, then computes the ratio
+    of target energy to error energy.  Only (est, ref) are used — the mixture
+    or noise signal is NOT part of this formula.
+
+      alpha    = <est, ref> / ||ref||²
+      s_target = alpha * ref
+      e_noise  = est - s_target
+      SI-SDR   = 10 · log10( ||s_target||² / ||e_noise||² )   [dB]
+    """
+    ref = np.asarray(ref, dtype=float)
+    est = np.asarray(est, dtype=float)
+    alpha    = np.dot(est, ref) / np.dot(ref, ref)
+    s_target = alpha * ref
+    e_noise  = est - s_target
+    return float(10.0 * np.log10(np.dot(s_target, s_target) / np.dot(e_noise, e_noise)))
+
+
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--clean_dir", type=str, required=True, help='Directory containing the clean data')
@@ -22,8 +42,7 @@ if __name__ == '__main__':
     parser.add_argument("--enhanced_dir", type=str, required=True, help='Directory containing the enhanced data')
     args = parser.parse_args()
 
-    data = {"filename": [], "pesq": [], "estoi": [], "si_sdr": [], "si_sir": [], "si_sar": [],
-            "si_sdr_noisy": [], "si_sdr_enh": [], "delta_si_sdr": []}
+    records = []  # list[dict]; add new metric keys here (e.g. "pesq", "dnsmos") when ready
 
     # Evaluate standard metrics
     noisy_files = []
@@ -42,75 +61,77 @@ if __name__ == '__main__':
         y, sr_y = read(join(args.noisy_dir, filename))
         x_hat, sr_x_hat = read(enh_path)
         assert sr_x == sr_y == sr_x_hat
-        n = y - x 
+        n = y - x
         x_hat_16k = librosa.resample(x_hat, orig_sr=sr_x_hat, target_sr=16000) if sr_x_hat != 16000 else x_hat
-        x_16k = librosa.resample(x, orig_sr=sr_x, target_sr=16000) if sr_x != 16000 else x
-        data["filename"].append(filename)
-        data["pesq"].append(pesq(16000, x_16k, x_hat_16k, 'wb'))
-        data["estoi"].append(stoi(x, x_hat, sr_x, extended=True))
-        si_sdr_enh, si_sir_enh, si_sar_enh = energy_ratios(x_hat, x, n)
-        si_sdr_noisy = energy_ratios(y, x, n)[0]
-        data["si_sdr"].append(si_sdr_enh)
-        data["si_sir"].append(si_sir_enh)
-        data["si_sar"].append(si_sar_enh)
-        data["si_sdr_noisy"].append(si_sdr_noisy)
-        data["si_sdr_enh"].append(si_sdr_enh)
-        data["delta_si_sdr"].append(si_sdr_enh - si_sdr_noisy)
+        x_16k     = librosa.resample(x,     orig_sr=sr_x,     target_sr=16000) if sr_x     != 16000 else x
+        _, si_sir_enh, si_sar_enh = energy_ratios(x_hat, x, n)
+        sisdr_enh_val   = sisdr(x_hat, x)   # SI-SDR(enhanced, clean) — absolute
+        sisdr_noisy_val = sisdr(y, x)        # SI-SDR(noisy,    clean) — for delta verification only
+        records.append({
+            "filename":    filename,
+            "sisdr_enh":   sisdr_enh_val,
+            "sisdr_noisy": sisdr_noisy_val,
+            "delta_sisdr": sisdr_enh_val - sisdr_noisy_val,
+            "pesq":        pesq(16000, x_16k, x_hat_16k, 'wb'),
+            "estoi":       stoi(x, x_hat, sr_x, extended=True),
+            "si_sir":      si_sir_enh,
+            "si_sar":      si_sar_enh,
+            # "dnsmos":  ...,  # add when ready
+        })
 
-    # Save results as DataFrame    
-    df = pd.DataFrame(data)
+    # Save results as DataFrame
+    df = pd.DataFrame(records)
 
     # Print results
-    print("PESQ: {:.2f} ± {:.2f}".format(*mean_std(df["pesq"].to_numpy())))
-    print("ESTOI: {:.2f} ± {:.2f}".format(*mean_std(df["estoi"].to_numpy())))
-    print("SI-SDR: {:.1f} ± {:.1f}".format(*mean_std(df["si_sdr"].to_numpy())))
-    print("SI-SIR: {:.1f} ± {:.1f}".format(*mean_std(df["si_sir"].to_numpy())))
-    print("SI-SAR: {:.1f} ± {:.1f}".format(*mean_std(df["si_sar"].to_numpy())))
+    print("SI-SDR: {:.1f} ± {:.1f}".format(*mean_std(df["sisdr_enh"].to_numpy())))
 
     # Save average results to file
     log = open(join(args.enhanced_dir, "_avg_results.txt"), "w")
-    log.write("PESQ: {:.2f} ± {:.2f}".format(*mean_std(df["pesq"].to_numpy())) + "\n")
-    log.write("ESTOI: {:.2f} ± {:.2f}".format(*mean_std(df["estoi"].to_numpy())) + "\n")
-    log.write("SI-SDR: {:.1f} ± {:.2f}".format(*mean_std(df["si_sdr"].to_numpy())) + "\n")
-    log.write("SI-SIR: {:.1f} ± {:.1f}".format(*mean_std(df["si_sir"].to_numpy())) + "\n")
-    log.write("SI-SAR: {:.1f} ± {:.1f}".format(*mean_std(df["si_sar"].to_numpy())) + "\n")
+    log.write("SI-SDR: {:.1f} ± {:.2f}".format(*mean_std(df["sisdr_enh"].to_numpy())) + "\n")
 
     # Save DataFrame as csv file
     df.to_csv(join(args.enhanced_dir, "_results.csv"), index=False)
 
     # Tail SI-SDR stats (per-utterance arrays)
-    enh    = np.array(data["si_sdr_enh"])
-    deltas = np.array(data["delta_si_sdr"])
-    enh_p10,   enh_p5,   enh_p1   = np.percentile(enh,    [10, 5, 1])
-    delta_p10, delta_p5, delta_p1 = np.percentile(deltas, [10, 5, 1])
+    # Table 2 uses sisdr_enh (ABSOLUTE SI-SDR enhanced vs clean) only.
+    # delta_sisdr is stored for sanity checking but NOT reported in Table 2.
+    enh   = df["sisdr_enh"].to_numpy()
+    noisy = df["sisdr_noisy"].to_numpy()
+    delta = df["delta_sisdr"].to_numpy()
+    enh_p10, enh_p5, enh_p1 = np.percentile(enh, [10, 5, 1], method="linear")
     tail_stats = {
-        "n":                  len(deltas),
-        "sisdr_enh_mean":     float(np.mean(enh)),
-        "sisdr_enh_p10":      float(enh_p10),
-        "sisdr_enh_p5":       float(enh_p5),
-        "sisdr_enh_p1":       float(enh_p1),
-        "delta_sisdr_mean":   float(np.mean(deltas)),
-        "delta_sisdr_p10":    float(delta_p10),
-        "delta_sisdr_p5":     float(delta_p5),
-        "delta_sisdr_p1":     float(delta_p1),
+        "n":              len(enh),
+        "sisdr_enh_mean": float(np.mean(enh)),
+        "sisdr_enh_p10":  float(enh_p10),
+        "sisdr_enh_p5":   float(enh_p5),
+        "sisdr_enh_p1":   float(enh_p1),
     }
+    table2_line = (
+        f"sisdr_enh (absolute):  "
+        f"mean={tail_stats['sisdr_enh_mean']:.2f}  "
+        f"p10={tail_stats['sisdr_enh_p10']:.2f}  "
+        f"p5={tail_stats['sisdr_enh_p5']:.2f}  "
+        f"p1={tail_stats['sisdr_enh_p1']:.2f}"
+    )
+    latex_line = (
+        f"LaTeX row:  "
+        f"{tail_stats['sisdr_enh_mean']:.1f} & "
+        f"{tail_stats['sisdr_enh_p10']:.1f} & "
+        f"{tail_stats['sisdr_enh_p5']:.1f} & "
+        f"{tail_stats['sisdr_enh_p1']:.1f}"
+    )
     print("\n--- Tail SI-SDR (Table 2) ---")
-    print("n={n}".format(**tail_stats))
-    print("sisdr_enh:   mean={sisdr_enh_mean:.2f}  p10={sisdr_enh_p10:.2f}  p5={sisdr_enh_p5:.2f}  p1={sisdr_enh_p1:.2f}".format(**tail_stats))
-    print("delta_sisdr: mean={delta_sisdr_mean:.2f}  p10={delta_sisdr_p10:.2f}  p5={delta_sisdr_p5:.2f}  p1={delta_sisdr_p1:.2f}".format(**tail_stats))
+    print(f"n={tail_stats['n']}")
+    print(table2_line)
+    print(latex_line)
     log.write("\n--- Tail SI-SDR (Table 2) ---\n")
-    log.write("n={n}\n".format(**tail_stats))
-    log.write("sisdr_enh:   mean={sisdr_enh_mean:.2f}  p10={sisdr_enh_p10:.2f}  p5={sisdr_enh_p5:.2f}  p1={sisdr_enh_p1:.2f}\n".format(**tail_stats))
-    log.write("delta_sisdr: mean={delta_sisdr_mean:.2f}  p10={delta_sisdr_p10:.2f}  p5={delta_sisdr_p5:.2f}  p1={delta_sisdr_p1:.2f}\n".format(**tail_stats))
+    log.write(f"n={tail_stats['n']}\n")
+    log.write(table2_line + "\n")
+    log.write(latex_line + "\n")
     log.close()
     _csv_path  = join(args.enhanced_dir, "tail_sisdr_perutt.csv")
     _json_path = join(args.enhanced_dir, "tail_sisdr_stats.json")
-    pd.DataFrame({
-        "filename":    data["filename"],
-        "sisdr_noisy": data["si_sdr_noisy"],
-        "sisdr_enh":   data["si_sdr_enh"],
-        "delta_sisdr": data["delta_si_sdr"],
-    }).to_csv(_csv_path, index=False)
+    df[["filename", "sisdr_enh", "sisdr_noisy", "delta_sisdr"]].to_csv(_csv_path, index=False)
     with open(_json_path, "w") as _f:
         json.dump(tail_stats, _f, indent=2)
 
@@ -119,9 +140,12 @@ if __name__ == '__main__':
     print("\n--- Verification ---")
     print(f"tail_sisdr_perutt.csv : {_os.path.abspath(_csv_path)}")
     print(f"tail_sisdr_stats.json : {_os.path.abspath(_json_path)}")
-    print(f"len(sisdr_enh)={len(enh)}  len(deltas)={len(deltas)}  n={tail_stats['n']}  match={len(enh)==len(deltas)==tail_stats['n']}")
-    print(f"sisdr_enh  min={enh.min():.2f}  max={enh.max():.2f}")
-    print(f"delta_sisdr min={deltas.min():.2f}  max={deltas.max():.2f}")
-    print("First 3 rows (filename | sisdr_noisy | sisdr_enh | delta_sisdr):")
-    for _i in range(min(3, len(data["filename"]))):
-        print(f"  {data['filename'][_i]}  |  {data['si_sdr_noisy'][_i]:.2f}  |  {data['si_sdr_enh'][_i]:.2f}  |  {data['delta_si_sdr'][_i]:.2f}")
+    print(f"n={tail_stats['n']}  sisdr_enh min={enh.min():.2f}  max={enh.max():.2f}")
+    print(f"sisdr_noisy mean={noisy.mean():.2f}  delta mean={delta.mean():.2f}  (sanity: sisdr_enh_mean - sisdr_noisy_mean = {np.mean(enh)-np.mean(noisy):.2f})")
+    assert tail_stats['sisdr_enh_p10'] >= tail_stats['sisdr_enh_p5'] >= tail_stats['sisdr_enh_p1'], \
+        "FAIL: percentiles not monotone!"
+    print("Monotonicity check: p10 >= p5 >= p1  PASS")
+    print("First 3 rows (filename | sisdr_noisy | sisdr_enh | delta):")
+    for _i in range(min(3, len(records))):
+        r = records[_i]
+        print(f"  {r['filename']}  |  {r['sisdr_noisy']:.2f}  |  {r['sisdr_enh']:.2f}  |  {r['delta_sisdr']:.2f}")

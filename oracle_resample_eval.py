@@ -1,7 +1,7 @@
 """Oracle resampling experiment.
 
 For each subset (worst-q% and random), run K independent enhancement attempts
-and compute oracle (best-of-K) and mean-of-K SI-SDR improvement over baseline.
+and compute oracle (best-of-K) and mean-of-K absolute SI-SDR (enhanced vs clean).
 
 Does NOT modify enhancement.py or calc_metrics.py — calls them via subprocess.
 
@@ -18,15 +18,14 @@ Usage example:
         --metrics_cmd "python calc_metrics.py --clean_dir voicebank/test_clean --noisy_dir voicebank/test_noisy"
 
 Outputs (all under --work_dir):
-  oracle_summary.csv      – per-file best/mean SI-SDR for K_max tries (backward compat)
-  oracle_curve.csv        – (subset, K, n, mean_improvement_best, …) for every K in K_list
-  fit_report.txt          – linear regression of mean_improvement_best vs log(K)/sqrt(log(K))
+  oracle_summary.csv           – per-file best/mean SI-SDR for K_max tries
+  oracle_absolute_summary.csv  – per-subset mean stats (subset, n_files, K, mean_baseline_sisdr_enh, mean_best_of_K, mean_mean_of_K)
+  oracle_curve.csv             – (subset, K, n, mean_best_sisdr, mean_mean_sisdr, ci_low, ci_high)
+  fit_report.txt               – linear regression of mean_best_sisdr vs log(K)/sqrt(log(K))
   plots/
-    best_of_K_vs_K.png
-    mean_of_K_vs_K.png
-    delta_hist_{subset}.png
-    delta_ccdf_semilog_{subset}.png
-    delta_ccdf_loglog_{subset}.png
+    best_of_K_vs_K.png        – mean(best_of_K − baseline) vs K (improvement over single-sample run)
+    sisdr_hist_{subset}.png           – pooled per-try SI-SDR (n_files × K_max points)
+    worst_sweep_curve_worst.png       – best/mean/baseline SI-SDR vs worst-x% of FULL test set (K=K_max)
 """
 
 import argparse
@@ -77,7 +76,7 @@ def run(cmd: str) -> bool:
 def load_sisdr(results_csv: Path) -> pd.Series:
     """Return a filename→si_sdr Series from a _results.csv."""
     df = pd.read_csv(results_csv)
-    return df.set_index("filename")["si_sdr"]
+    return df.set_index("filename")["sisdr_enh"]
 
 
 def _linregress(x, y):
@@ -115,18 +114,23 @@ def compute_curve_stats(
     baseline_sisdr: pd.Series,
     K_list: list[int],
 ) -> pd.DataFrame:
-    """For each (subset, K) pair, compute aggregate improvement stats.
+    """For each (subset, K) pair, compute aggregate absolute SI-SDR stats.
 
     Only tries 0..K-1 are considered for a given K.  Files with no valid try
     or no baseline value are excluded (counted in the returned n).
     Bootstrap 95% CI (100 resamples, seed 42) is added as ci_low / ci_high.
+
+    Columns: subset, K, n, mean_best_sisdr, mean_mean_sisdr, mean_improvement_best, ci_low, ci_high
+      mean_best_sisdr       — mean over files of max(sisdr_enh across K tries)
+      mean_mean_sisdr       — mean over files of mean(sisdr_enh across K tries)
+      mean_improvement_best — mean over files of (best_of_K − baseline_sisdr_enh)
     """
     # Fixed mapping avoids Python's randomised hash() across processes/versions.
     _subset_seed = {"worst": 1, "random": 2}
     rows = []
     for subset_name, file_scores in results.items():
         for K in sorted(K_list):
-            imp_best, imp_mean = [], []
+            abs_best, abs_mean, baselines = [], [], []
             for fname, try_map in file_scores.items():
                 vals = [
                     try_map[t] for t in range(K)
@@ -137,53 +141,49 @@ def compute_curve_stats(
                 base = float(baseline_sisdr.get(fname, float("nan")))
                 if np.isnan(base):
                     continue
-                imp_best.append(float(np.max(vals)) - base)
-                imp_mean.append(float(np.mean(vals)) - base)
+                abs_best.append(float(np.max(vals)))
+                abs_mean.append(float(np.mean(vals)))
+                baselines.append(base)
 
-            n = len(imp_best)
+            n = len(abs_best)
             if n == 0:
                 rows.append({
                     "subset": subset_name, "K": K, "n": 0,
+                    "mean_best_sisdr": float("nan"),
+                    "mean_mean_sisdr": float("nan"),
                     "mean_improvement_best": float("nan"),
-                    "mean_improvement_mean": float("nan"),
-                    "p_improvement_best_gt0": float("nan"),
                     "ci_low": float("nan"),
                     "ci_high": float("nan"),
                 })
             else:
-                arr = np.array(imp_best)
+                arr = np.array(abs_best)
+                base_arr = np.array(baselines)
                 local_rng = np.random.default_rng(
                     42 + 1000 * _subset_seed.get(subset_name, 0) + K
                 )
                 ci_low, ci_high = _bootstrap_ci(arr, rng=local_rng)
                 rows.append({
                     "subset": subset_name, "K": K, "n": n,
-                    "mean_improvement_best": float(arr.mean()),
-                    "mean_improvement_mean": float(np.mean(imp_mean)),
-                    "p_improvement_best_gt0": float((arr > 0).mean()),
+                    "mean_best_sisdr": float(arr.mean()),
+                    "mean_mean_sisdr": float(np.mean(abs_mean)),
+                    "mean_improvement_best": float((arr - base_arr).mean()),
                     "ci_low": ci_low,
                     "ci_high": ci_high,
                 })
     return pd.DataFrame(rows)
 
 
-def collect_deltas(
-    results: dict,
-    baseline_sisdr: pd.Series,
-) -> dict[str, list[float]]:
-    """Pool all per-try Δ = si_sdr_try − baseline for each subset."""
-    deltas: dict[str, list[float]] = {}
+def collect_sisdr(results: dict) -> dict[str, list[float]]:
+    """Pool all per-try absolute SI-SDR (enhanced vs clean) for each subset."""
+    sisdr_vals: dict[str, list[float]] = {}
     for subset_name, file_scores in results.items():
         d = []
-        for fname, try_map in file_scores.items():
-            base = float(baseline_sisdr.get(fname, float("nan")))
-            if np.isnan(base):
-                continue
+        for try_map in file_scores.values():
             for val in try_map.values():
                 if not np.isnan(val):
-                    d.append(val - base)
-        deltas[subset_name] = d
-    return deltas
+                    d.append(val)
+        sisdr_vals[subset_name] = d
+    return sisdr_vals
 
 
 # ── sanity logging ────────────────────────────────────────────────────────────
@@ -204,21 +204,21 @@ def log_curve_sanity(curve_df: pd.DataFrame) -> None:
                 return f"{v:+.3f}" if not np.isnan(v) else "      nan"
             print(
                 f"  {subset_name:<8}  {int(row['K']):>4}  {int(row['n']):>6}"
-                f"  {_fmt(row['mean_improvement_best']):>10}"
-                f"  {_fmt(row['mean_improvement_mean']):>10}"
+                f"  {_fmt(row['mean_best_sisdr']):>10}"
+                f"  {_fmt(row['mean_mean_sisdr']):>10}"
                 f"  {_fmt(row['ci_low']):>8}"
                 f"  {_fmt(row['ci_high']):>8}"
             )
         print()
 
         # ── monotonicity check ────────────────────────────────────────────────
-        valid = sub.dropna(subset=["mean_improvement_best"]).sort_values("K")
-        mb_vals = valid["mean_improvement_best"].values
+        valid = sub.dropna(subset=["mean_best_sisdr"]).sort_values("K")
+        mb_vals = valid["mean_best_sisdr"].values
         K_vals  = valid["K"].values
         for i in range(1, len(mb_vals)):
             if mb_vals[i] < mb_vals[i - 1]:
                 print(
-                    f"  WARNING [{subset_name}]: mean_improvement_best not monotone: "
+                    f"  WARNING [{subset_name}]: mean_best_sisdr not monotone: "
                     f"K={int(K_vals[i-1])}→K={int(K_vals[i])}: "
                     f"{mb_vals[i-1]:+.3f}→{mb_vals[i]:+.3f} dB"
                 )
@@ -248,7 +248,7 @@ def log_curve_sanity(curve_df: pd.DataFrame) -> None:
 # ── fit diagnostics ───────────────────────────────────────────────────────────
 
 def fit_diagnostics(curve_df: pd.DataFrame) -> str:
-    """Fit y(K) = mean_improvement_bestK against log(K) and sqrt(log(K)) bases.
+    """Fit y(K) = mean_best_sisdr vs log(K) and sqrt(log(K)) bases.
 
     Requires at least 3 distinct K values with valid data per subset.
     Returns a formatted report string.
@@ -257,7 +257,7 @@ def fit_diagnostics(curve_df: pd.DataFrame) -> str:
     for subset_name in sorted(curve_df["subset"].unique()):
         sub = (
             curve_df[curve_df["subset"] == subset_name]
-            .dropna(subset=["mean_improvement_best"])
+            .dropna(subset=["mean_best_sisdr"])
             .query("K >= 1")
             .sort_values("K")
         )
@@ -267,7 +267,7 @@ def fit_diagnostics(curve_df: pd.DataFrame) -> str:
             continue
 
         K_vals = sub["K"].values.astype(float)
-        y = sub["mean_improvement_best"].values
+        y = sub["mean_best_sisdr"].values
         lines.append(f"Subset: {subset_name}  (n_K={len(sub)}, K={list(K_vals.astype(int))})")
 
         for label, x_feat in [
@@ -313,61 +313,128 @@ def plot_curve(
     print(f"Saved: {save_path}")
 
 
-def plot_delta_hist(deltas: list[float], subset_name: str, save_path: Path) -> None:
+def plot_sisdr_hist(sisdr_vals: list[float], subset_name: str, save_path: Path) -> None:
+    """Histogram of per-try absolute SI-SDR (enhanced vs clean) for one subset.
+
+    Each enhanced file contributes K points (one per try).  Pooled over all
+    files in the subset → n_files × K_max data points total.
+    """
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.hist(deltas, bins=50, edgecolor="black", alpha=0.75)
-    ax.axvline(0, color="red", linestyle="--", linewidth=1.5, label="Δ=0")
-    ax.set_xlabel("Δ SI-SDR (dB)")
+    ax.hist(sisdr_vals, bins=50, edgecolor="black", alpha=0.75)
+    ax.set_xlabel("SI-SDR (enhanced vs clean, dB)")
     ax.set_ylabel("Count")
-    ax.set_title(f"Per-try SI-SDR improvement distribution ({subset_name})")
-    ax.legend()
+    ax.set_title(f"Pooled per-try SI-SDR distribution ({subset_name}, n={len(sisdr_vals)})")
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f"Saved: {save_path}")
 
 
-def plot_ccdf_semilog(deltas: list[float], subset_name: str, save_path: Path) -> None:
-    """CCDF P(Δ > x) vs x with semilog-y axis."""
-    d = np.sort(deltas)
-    n = len(d)
-    # Empirical survivor: P(Δ > d[i]) = 1 - (i+1)/n
-    p = 1.0 - np.arange(1, n + 1) / n
-    # Avoid log(0): clip last point
-    p = np.maximum(p, 1e-10)
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.semilogy(d, p, linewidth=1.5)
-    ax.axvline(0, color="red", linestyle="--", linewidth=1.2, label="Δ=0")
-    ax.set_xlabel("Δ SI-SDR (dB)")
-    ax.set_ylabel("P(Δ > x)")
-    ax.set_title(f"CCDF of Δ — semilog-y ({subset_name})")
-    ax.legend()
-    ax.grid(True, which="both", alpha=0.4)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
-    print(f"Saved: {save_path}")
 
+def plot_worst_sweep_curve(
+    summary_df: pd.DataFrame,
+    subset_name: str,
+    X_pct: list[float],
+    save_path: Path,
+    baseline_all_sisdr: pd.Series | None = None,
+    K: int | None = None,
+) -> None:
+    """Plot mean best_of_K, mean_of_K, and baseline SI-SDR vs worst-x% cutoff.
 
-def plot_ccdf_loglog(deltas: list[float], subset_name: str, save_path: Path) -> None:
-    """CCDF P(Δ > x) vs x with log-log axes (positive Δ only)."""
-    d_pos = np.sort(np.array(deltas)[np.array(deltas) > 0])
-    if len(d_pos) < 2:
-        print(f"Warning: too few positive deltas for log-log CCDF ({subset_name}), skipping.")
+    If baseline_all_sisdr is provided (full test-set baseline), x% is taken
+    relative to ALL test files ranked by baseline SI-SDR ascending.  Only x
+    values for which every selected file has resampling data are plotted, so
+    the curve naturally extends up to q_percent.
+
+    If K is provided, best_of_K and mean_of_K are computed from try_0..try_{K-1}
+    columns (capped at available tries).  Otherwise the precomputed best_of_K /
+    mean_of_K columns (= K_max) are used.
+    """
+    sub = summary_df[summary_df["subset"] == subset_name].copy()
+    if sub.empty:
+        print(f"Warning: no data for subset '{subset_name}', skipping sweep plot.")
         return
-    n = len(d_pos)
-    p = 1.0 - np.arange(1, n + 1) / n
-    p = np.maximum(p, 1e-10)
+
+    # Compute per-file best / mean for the requested K
+    if K is not None:
+        try_cols = sorted([c for c in sub.columns if c.startswith("try_")],
+                          key=lambda c: int(c.split("_")[1]))
+        K_actual = min(K, len(try_cols))
+        if K_actual < K:
+            print(f"Warning: only {K_actual} tries available, using K={K_actual}")
+        use_cols = try_cols[:K_actual]
+        sub["_best"] = sub[use_cols].max(axis=1)
+        sub["_mean"] = sub[use_cols].mean(axis=1)
+    else:
+        K_actual = None
+        sub["_best"] = sub["best_of_K"]
+        sub["_mean"] = sub["mean_of_K"]
+
+    sub_indexed = sub.set_index("filename")
+
+    # Determine ranking pool and total N
+    if baseline_all_sisdr is not None:
+        all_ranked = baseline_all_sisdr.sort_values().index.tolist()
+        n_total = len(all_ranked)
+    else:
+        all_ranked = sub_indexed["baseline_sisdr_enh"].sort_values().index.tolist()
+        n_total = len(all_ranked)
+
+    x_vals, n_vals, y_best, y_mean, y_base = [], [], [], [], []
+    for x in X_pct:
+        k = max(1, int(np.ceil(n_total * x / 100)))
+        if k > n_total:
+            continue
+        group_fnames = all_ranked[:k]
+        # Skip this x if any file in the group lacks resampling data
+        if any(f not in sub_indexed.index for f in group_fnames):
+            continue
+        group_best = sub_indexed.loc[group_fnames, "_best"]
+        group_mean = sub_indexed.loc[group_fnames, "_mean"]
+        if baseline_all_sisdr is not None:
+            group_base = baseline_all_sisdr[group_fnames]
+        else:
+            group_base = sub_indexed.loc[group_fnames, "baseline_sisdr_enh"]
+        x_vals.append(x)
+        n_vals.append(k)
+        y_best.append(float(group_best.mean()))
+        y_mean.append(float(group_mean.mean()))
+        y_base.append(float(group_base.mean()))
+
+    if not x_vals:
+        print(f"Warning: no valid x% points for subset '{subset_name}', skipping sweep plot.")
+        return
+
+    K_label = f"K={K_actual}" if K_actual is not None else "K=max"
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.loglog(d_pos, p, linewidth=1.5)
-    ax.set_xlabel("Δ SI-SDR (dB)")
-    ax.set_ylabel("P(Δ > x)")
-    ax.set_title(f"CCDF of Δ — log-log, x>0 ({subset_name})")
-    ax.grid(True, which="both", alpha=0.4)
+    ax.plot(x_vals, y_best, marker="o", label=f"best_of_K ({K_label})")
+    ax.plot(x_vals, y_mean, marker="s", label=f"mean_of_K ({K_label})")
+    ax.plot(x_vals, y_base, marker="^", linestyle="--", label="baseline")
+    ax.set_xlabel("Worst subset size (% of full test set)")
+    ax.set_ylabel("SI-SDR (enhanced vs clean, dB)")
+    ax.set_title(f"Oracle resampling — worst-x% of test set ({K_label})")
+    ax.set_xticks(x_vals)
+    ax.legend()
+    ax.grid(True, alpha=0.4)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f"Saved: {save_path}")
+
+    # Save the same data as a text table
+    txt_path = save_path.with_suffix(".txt")
+    col_w = 12
+    header = (f"{'worst_%':>{col_w}}  {'n_files':>{col_w}}"
+              f"  {'baseline':>{col_w}}  {'best_of_K':>{col_w}}  {'mean_of_K':>{col_w}}")
+    sep = "  ".join(["-" * col_w] * 5)
+    lines = [f"# worst_sweep_curve — {subset_name}  ({K_label})", header, sep]
+    for x, n, yb, ym, ybase in zip(x_vals, n_vals, y_best, y_mean, y_base):
+        lines.append(
+            f"{x:>{col_w}.1f}  {n:>{col_w}d}"
+            f"  {ybase:>{col_w}.4f}  {yb:>{col_w}.4f}  {ym:>{col_w}.4f}"
+        )
+    txt_path.write_text("\n".join(lines) + "\n")
+    print(f"Saved: {txt_path}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -470,7 +537,8 @@ def main():
                 else:
                     print(f"Warning: {fname} missing from {enh_dir} results")
 
-    # ── 5. Oracle summary CSV (K_max tries — backward compatible) ─────────────
+    # ── 5. Oracle summary CSV (one row per file × subset) ────────────────────
+    # Columns: filename, subset, baseline_sisdr_enh, best_of_K, mean_of_K, try_0..K-1
     rows = []
     for subset_name, file_scores in results.items():
         for fname, try_map in file_scores.items():
@@ -478,16 +546,12 @@ def main():
             if not vals:
                 continue
             base = float(baseline_sisdr.get(fname, float("nan")))
-            best = float(np.max(vals))
-            mean_val = float(np.mean(vals))
             row = {
-                "filename":         fname,
-                "subset":           subset_name,
-                "baseline_si_sdr":  base,
-                "best_of_K":        best,
-                "mean_of_K":        mean_val,
-                "improvement_best": best - base,
-                "improvement_mean": mean_val - base,
+                "filename":           fname,
+                "subset":             subset_name,
+                "baseline_sisdr_enh": base,
+                "best_of_K":          float(np.max(vals)),
+                "mean_of_K":          float(np.mean(vals)),
             }
             for t in range(K_max):
                 row[f"try_{t}"] = try_map.get(t, float("nan"))
@@ -498,18 +562,37 @@ def main():
     summary_df.to_csv(summary_path, index=False)
     print(f"\nOracle summary saved to {summary_path}")
 
-    # ── 6. Print K_max summary stats ──────────────────────────────────────────
-    print(f"\n=== Oracle Resampling Results (K_max={K_max}) ===")
+    # ── 6. Absolute SI-SDR summary table (console + CSV) ─────────────────────
+    _K_inferred = sum(1 for c in summary_df.columns if c.startswith("try_"))
+    abs_summary_rows = []
     for subset_name in ["worst", "random"]:
         sub = summary_df[summary_df["subset"] == subset_name]
         if sub.empty:
             continue
-        imp   = sub["improvement_best"]
-        p_gt0 = (imp > 0).mean()
-        print(f"\n  Subset: {subset_name}  (n={len(sub)}, K={K_max})")
-        print(f"  mean improvement_best : {imp.mean():.2f} dB")
-        print(f"  mean improvement_mean : {sub['improvement_mean'].mean():.2f} dB")
-        print(f"  P(improvement_best>0) : {p_gt0:.1%}")
+        abs_summary_rows.append({
+            "subset":                  subset_name,
+            "n_files":                 sub["filename"].nunique(),
+            "K":                       _K_inferred,
+            "mean_baseline_sisdr_enh": round(float(sub["baseline_sisdr_enh"].mean()), 4),
+            "mean_best_of_K":          round(float(sub["best_of_K"].mean()), 4),
+            "mean_mean_of_K":          round(float(sub["mean_of_K"].mean()), 4),
+        })
+    abs_summary_path = work_dir / "oracle_absolute_summary.csv"
+    pd.DataFrame(abs_summary_rows).to_csv(abs_summary_path, index=False)
+    print(f"\nAbsolute summary saved to {abs_summary_path}")
+
+    # pretty-print as aligned table
+    print("\n=== Oracle Resampling Results (Absolute SI-SDR) ===\n")
+    _hdr = f"  {'subset':<8}  {'n':>6}  {'K':>4}  {'baseline (dB)':>14}  {'best_of_K (dB)':>15}  {'mean_of_K (dB)':>15}"
+    print(_hdr)
+    print("  " + "-" * (len(_hdr) - 2))
+    for r in abs_summary_rows:
+        print(
+            f"  {r['subset']:<8}  {r['n_files']:>6}  {r['K']:>4}"
+            f"  {r['mean_baseline_sisdr_enh']:>14.2f}"
+            f"  {r['mean_best_of_K']:>15.2f}"
+            f"  {r['mean_mean_of_K']:>15.2f}"
+        )
 
     # ── 7. Oracle curve stats (one row per subset × K) ────────────────────────
     curve_df = compute_curve_stats(results, baseline_sisdr, K_list)
@@ -522,25 +605,27 @@ def main():
     if len(K_list) >= 2:
         plot_curve(
             curve_df, "mean_improvement_best",
-            "Mean best-of-K SI-SDR improvement (dB)", "Best-of-K vs K",
+            "Mean best-of-K improvement over single-sample baseline (dB)",
+            "Oracle gain: best-of-K SI-SDR(enh,clean) − SI-SDR(baseline,clean)",
             plots_dir / "best_of_K_vs_K.png", K_list,
-        )
-        plot_curve(
-            curve_df, "mean_improvement_mean",
-            "Mean mean-of-K SI-SDR improvement (dB)", "Mean-of-K vs K",
-            plots_dir / "mean_of_K_vs_K.png", K_list,
         )
     else:
         print("Skipping curve plots (need at least 2 K values).")
 
-    all_deltas = collect_deltas(results, baseline_sisdr)
-    for subset_name, deltas in all_deltas.items():
-        if not deltas:
-            print(f"Warning: no deltas for {subset_name}, skipping delta plots.")
+    all_sisdr = collect_sisdr(results)
+    for subset_name, sisdr_vals in all_sisdr.items():
+        if not sisdr_vals:
+            print(f"Warning: no sisdr values for {subset_name}, skipping histogram.")
             continue
-        plot_delta_hist(deltas, subset_name, plots_dir / f"delta_hist_{subset_name}.png")
-        plot_ccdf_semilog(deltas, subset_name, plots_dir / f"delta_ccdf_semilog_{subset_name}.png")
-        plot_ccdf_loglog(deltas, subset_name, plots_dir / f"delta_ccdf_loglog_{subset_name}.png")
+        plot_sisdr_hist(sisdr_vals, subset_name, plots_dir / f"sisdr_hist_{subset_name}.png")
+
+    _X_pct = [2, 5, 10, 15, 20, 25, 30, 35, 40, 45]
+    plot_worst_sweep_curve(
+        summary_df, "worst", _X_pct,
+        plots_dir / "worst_sweep_curve_worst.png",
+        baseline_all_sisdr=baseline_sisdr,
+        K=K_max,
+    )
 
     # ── 9. Fit diagnostics ────────────────────────────────────────────────────
     if len(K_list) >= 3:
