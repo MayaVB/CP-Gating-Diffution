@@ -35,12 +35,51 @@ def sisdr(est: np.ndarray, ref: np.ndarray) -> float:
     return float(10.0 * np.log10(np.dot(s_target, s_target) / np.dot(e_noise, e_noise)))
 
 
+def _to_16k(audio: np.ndarray, sr: int) -> np.ndarray:
+    """Resample *audio* to 16 kHz, collapse to mono, return float32.
+
+    soundfile returns [T, channels] for multi-channel files; squeeze to 1-D
+    before resampling so DNSMOS always receives a flat array.
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim == 2:          # [T, channels] → mono by averaging
+        audio = audio.mean(axis=1)
+    if sr == 16000:
+        return audio
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly
+        g = gcd(16000, sr)
+        return resample_poly(audio, 16000 // g, sr // g).astype(np.float32)
+    except ImportError:
+        # librosa is already a project dependency — use as fallback
+        return librosa.resample(audio, orig_sr=sr, target_sr=16000)
+
+
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--clean_dir", type=str, required=True, help='Directory containing the clean data')
     parser.add_argument("--noisy_dir", type=str, required=True, help='Directory containing the noisy data')
     parser.add_argument("--enhanced_dir", type=str, required=True, help='Directory containing the enhanced data')
+    parser.add_argument("--compute_dnsmos", action="store_true", default=False,
+                        help='Compute DNSMOS overall MOS per file (requires speechmos package)')
+    parser.add_argument("--dnsmos", action="store_true", default=False,
+                        help='Alias for --compute_dnsmos')
     args = parser.parse_args()
+
+    # Resolve DNSMOS callable once (None if unavailable or flag not set)
+    _dnsmos_fn = None
+    if args.compute_dnsmos or args.dnsmos:
+        try:
+            from utils.dnsmos_helper import compute_dnsmos as _compute_dnsmos, is_available as _dns_avail
+            if _dns_avail():
+                _dnsmos_fn = _compute_dnsmos
+            else:
+                print("WARNING: --compute_dnsmos set but speechmos is not installed; "
+                      "dnsmos_ovrl will be NaN for all files.")
+        except ImportError:
+            print("WARNING: Could not import utils.dnsmos_helper; "
+                  "dnsmos_ovrl will be NaN for all files.")
 
     records = []  # list[dict]; add new metric keys here (e.g. "pesq", "dnsmos") when ready
 
@@ -67,6 +106,11 @@ if __name__ == '__main__':
         _, si_sir_enh, si_sar_enh = energy_ratios(x_hat, x, n)
         sisdr_enh_val   = sisdr(x_hat, x)   # SI-SDR(enhanced, clean) — absolute
         sisdr_noisy_val = sisdr(y, x)        # SI-SDR(noisy,    clean) — for delta verification only
+        if _dnsmos_fn is not None:
+            _raw = _dnsmos_fn(_to_16k(x_hat, sr_x_hat), 16000)
+            dnsmos_ovrl = float(_raw) if _raw is not None else float("nan")
+        else:
+            dnsmos_ovrl = float("nan")
         records.append({
             "filename":    filename,
             "sisdr_enh":   sisdr_enh_val,
@@ -76,7 +120,7 @@ if __name__ == '__main__':
             "estoi":       stoi(x, x_hat, sr_x, extended=True),
             "si_sir":      si_sir_enh,
             "si_sar":      si_sar_enh,
-            # "dnsmos":  ...,  # add when ready
+            "dnsmos_ovrl": dnsmos_ovrl,
         })
 
     # Save results as DataFrame
@@ -84,10 +128,18 @@ if __name__ == '__main__':
 
     # Print results
     print("SI-SDR: {:.1f} ± {:.1f}".format(*mean_std(df["sisdr_enh"].to_numpy())))
+    _dnsmos_enabled = args.compute_dnsmos or args.dnsmos
+    if _dnsmos_enabled:
+        valid_dns = df["dnsmos_ovrl"].dropna()
+        dns_mean = float(valid_dns.mean()) if len(valid_dns) > 0 else float("nan")
+        dns_std  = float(valid_dns.std())  if len(valid_dns) > 0 else float("nan")
+        print(f"DNSMOS: {dns_mean:.3f} ± {dns_std:.3f}")
 
     # Save average results to file
     log = open(join(args.enhanced_dir, "_avg_results.txt"), "w")
     log.write("SI-SDR: {:.1f} ± {:.2f}".format(*mean_std(df["sisdr_enh"].to_numpy())) + "\n")
+    if _dnsmos_enabled:
+        log.write(f"DNSMOS: {dns_mean:.3f} ± {dns_std:.3f}\n")
 
     # Save DataFrame as csv file
     df.to_csv(join(args.enhanced_dir, "_results.csv"), index=False)
@@ -132,6 +184,9 @@ if __name__ == '__main__':
     _csv_path  = join(args.enhanced_dir, "tail_sisdr_perutt.csv")
     _json_path = join(args.enhanced_dir, "tail_sisdr_stats.json")
     df[["filename", "sisdr_enh", "sisdr_noisy", "delta_sisdr"]].to_csv(_csv_path, index=False)
+    if _dnsmos_enabled:
+        _dns_csv = join(args.enhanced_dir, "dnsmos_perutt.csv")
+        df[["filename", "dnsmos_ovrl"]].rename(columns={"dnsmos_ovrl": "dnsmos"}).to_csv(_dns_csv, index=False)
     with open(_json_path, "w") as _f:
         json.dump(tail_stats, _f, indent=2)
 

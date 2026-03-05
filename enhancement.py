@@ -71,6 +71,10 @@ if __name__ == '__main__':
     parser.add_argument("--file_list", type=str, default=None, help="Optional path to a text file listing filenames (relative to --test_dir) to process; one per line. If omitted, all WAV/FLAC in test_dir are processed.")
     parser.add_argument("--debug_level", type=int, default=0, help="0=off, 1=enable debug prints and per-step WAV saving")
     parser.add_argument("--save_step_wavs", action="store_true", help="Save per-step WAV snapshots at steps {0,7,15,22,29} for first 2 test utterances (test mode only)")
+    parser.add_argument("--save_steps", type=str, default="0,7,15,22,29", help="Comma-separated diffusion step indices to snapshot (used with --save_steps_all or --save_steps_limit)")
+    parser.add_argument("--save_steps_all", action="store_true", help="Save step snapshots for all utterances (requires OUVESDE + PC sampler)")
+    parser.add_argument("--save_steps_dir_prefix", type=str, default="step", help="Directory prefix for step snapshots; outputs to {enhanced_dir}/{prefix}_{k:03d}/")
+    parser.add_argument("--save_steps_limit", type=int, default=0, help="If >0, save step snapshots only for first N utterances (0 = no limit; use with --save_steps_all)")
     args = parser.parse_args()
 
     # Research output directories (rooted under enhanced_dir)
@@ -88,6 +92,19 @@ if __name__ == '__main__':
     model = ScoreModel.load_from_checkpoint(args.ckpt, map_location=args.device)
     model.t_eps = args.t_eps
     model.eval()
+
+    # Generic step-snapshot feature (--save_steps_all / --save_steps_limit)
+    _save_steps_set = {int(s.strip()) for s in args.save_steps.split(',') if s.strip()}
+    _save_steps_enabled = args.save_steps_all or args.save_steps_limit > 0
+    if _save_steps_enabled:
+        _step_cb_supported = (
+            model.sde.__class__.__name__ == 'OUVESDE' and args.sampler_type == 'pc'
+        )
+        if not _step_cb_supported:
+            print("Warning: --save_steps_all/--save_steps_limit requires OUVESDE + PC sampler; "
+                  "step saving will be skipped.")
+            _save_steps_enabled = False
+    _save_steps_utt_idx = [0]  # mutable counter: utterances processed so far
 
     # args.N = number of reverse diffusion steps (default 30), NOT dataset size.
     # k_start is clamped to N-1 so at least the final step is always gated.
@@ -208,6 +225,23 @@ if __name__ == '__main__':
         # Per-step score buffer: populated when gate_compute_tau is active.
         _accepted_g_steps = []
 
+        # Generic step-snapshot callback (independent of gating)
+        def _do_save_step(_si):
+            if not _save_steps_enabled:
+                return
+            _k = _si["step_idx"]
+            if _k not in _save_steps_set:
+                return
+            if not args.save_steps_all:
+                if args.save_steps_limit > 0 and _save_steps_utt_idx[0] >= args.save_steps_limit:
+                    return
+            _stem = os.path.splitext(os.path.basename(filename))[0]
+            _wav_k = (model.to_audio(_si["xt_mean"].squeeze(), T_orig) * norm_factor).cpu().numpy()
+            _step_dir = join(args.enhanced_dir, f"{args.save_steps_dir_prefix}_{_k:03d}")
+            makedirs(_step_dir, exist_ok=True)
+            _wav_path = join(_step_dir, f"{_stem}_step{_k:03d}.wav")
+            write(_wav_path, _wav_k, target_sr)
+
         # Build per-step cache once per utterance whenever per-step scoring is needed.
         if args.gate_tau_path or args.gate_compute_tau:
             _yf_power = (Y[0].abs() ** 2).sum(dim=(0, 1)).detach().cpu().numpy()
@@ -253,6 +287,7 @@ if __name__ == '__main__':
                         write(_wav_path, _wav_k, target_sr)
                         print(f"[SAVE_STEP_WAV_TEST] idx={len(gate_log)} step={k} "
                               f"g={g_k:.4f} path={_wav_path}")
+                    _do_save_step(_si)
                     if not _il and _rm[0] > _tau:
                         raise SamplingAborted(_si["step_idx"], _rm[0])
                 _set_seeds(args.gate_seed + _attempt)
@@ -285,6 +320,7 @@ if __name__ == '__main__':
                             args.gate_combine,
                         )
                         _buf.append(g_k)
+                        _do_save_step(_si)
                         # Per-step WAV saving and debug prints (debug_level > 0 only)
                         if args.debug_level > 0 and _si["step_idx"] in (0, 7, 15, 22, 29):
                             _intended = join(args.enhanced_dir, f"step_{_si['step_idx']:03d}", filename)
@@ -315,7 +351,8 @@ if __name__ == '__main__':
                 sample, _ = _build_sampler(step_callback=_step_cb_cal)()
                 _accepted_g_steps = _attempt_g_steps
             else:
-                sample, _ = _build_sampler()()
+                _cb = _do_save_step if _save_steps_enabled else None
+                sample, _ = _build_sampler(step_callback=_cb)()
             _num_restarts = 0
             _try0_running_max = None
             _first_reject_step = None
@@ -408,6 +445,8 @@ if __name__ == '__main__':
                 print(f"[DEBUG_GATE_SAVE] triggered WAV save → {join(args.enhanced_dir, filename)}")
             makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
             write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
+
+        _save_steps_utt_idx[0] += 1
 
     if args.gate_compute_tau:
         if args.gate_plot:

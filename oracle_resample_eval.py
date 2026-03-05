@@ -79,6 +79,17 @@ def load_sisdr(results_csv: Path) -> pd.Series:
     return df.set_index("filename")["sisdr_enh"]
 
 
+def load_dnsmos(results_csv: Path) -> pd.Series:
+    """Return a filename→dnsmos_ovrl Series from a _results.csv.
+
+    Returns an empty Series when the column is absent (DNSMOS not computed).
+    """
+    df = pd.read_csv(results_csv)
+    if "dnsmos_ovrl" not in df.columns:
+        return pd.Series(dtype=float, name="dnsmos_ovrl")
+    return df.set_index("filename")["dnsmos_ovrl"]
+
+
 def _linregress(x, y):
     """OLS regression; returns (slope, intercept, r_squared)."""
     x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
@@ -186,13 +197,185 @@ def collect_sisdr(results: dict) -> dict[str, list[float]]:
     return sisdr_vals
 
 
+def compute_dnsmos_oracle(
+    results: dict,
+    dnsmos_results: dict,
+    baseline_sisdr: pd.Series,
+) -> dict:
+    """Select each file's try by highest dnsmos_ovrl; return SI-SDR improvement stats.
+
+    k* = argmax_k dnsmos_ovrl[file, k] ignoring NaNs.
+    If all dnsmos are NaN/missing for a file: fallback to SI-SDR argmax and count it.
+
+    Returns:
+        dict[subset_name] = {
+            "improvements": list[float],   # SI-SDR(k*) − baseline, one per valid file
+            "n_fallback":   int,           # files where DNSMOS fully missing → SI-SDR argmax used
+        }
+    """
+    out: dict = {}
+    for subset_name, file_scores in results.items():
+        improvements: list[float] = []
+        n_fallback = 0
+        dns_sub = dnsmos_results.get(subset_name, {})
+        for fname, try_map in file_scores.items():
+            base = float(baseline_sisdr.get(fname, float("nan")))
+            if np.isnan(base):
+                continue
+            dns_map = dns_sub.get(fname, {})
+            valid_dns = {t: v for t, v in dns_map.items() if not np.isnan(v)}
+            if valid_dns:
+                k_star = max(valid_dns, key=valid_dns.__getitem__)
+            else:
+                # Fallback: select by SI-SDR argmax
+                n_fallback += 1
+                valid_sdr = {t: v for t, v in try_map.items() if not np.isnan(v)}
+                if not valid_sdr:
+                    continue
+                k_star = max(valid_sdr, key=valid_sdr.__getitem__)
+            if k_star not in try_map or np.isnan(try_map.get(k_star, float("nan"))):
+                continue
+            improvements.append(float(try_map[k_star]) - base)
+        out[subset_name] = {"improvements": improvements, "n_fallback": n_fallback}
+    return out
+
+
+def compute_dnsmos_curve_stats(
+    dnsmos_results: dict,
+    K_list: list[int],
+    baseline_dnsmos: "pd.Series | None" = None,
+) -> pd.DataFrame:
+    """Per-(subset, K) DNSMOS aggregate stats, analogous to compute_curve_stats.
+
+    For each file, collects max and mean of non-NaN dnsmos_ovrl across tries 0..K-1.
+    Files with no valid DNSMOS across K tries are excluded and counted in n_excluded.
+
+    Columns: subset, K, n, n_excluded, mean_best_dnsmos, mean_mean_dnsmos,
+             mean_impr_dnsmos, p_best_gt_baseline, ci_low, ci_high
+    mean_impr_dnsmos and p_best_gt_baseline are NaN when baseline_dnsmos is None.
+    """
+    _subset_seed = {"worst": 1, "random": 2}
+    rows = []
+    for subset_name, file_scores in dnsmos_results.items():
+        for K in sorted(K_list):
+            abs_best, abs_mean, baselines = [], [], []
+            n_excluded = 0
+            for fname, try_map in file_scores.items():
+                vals = [
+                    try_map[t] for t in range(K)
+                    if t in try_map and not np.isnan(try_map[t])
+                ]
+                if not vals:
+                    n_excluded += 1
+                    continue
+                abs_best.append(float(np.max(vals)))
+                abs_mean.append(float(np.mean(vals)))
+                if baseline_dnsmos is not None:
+                    baselines.append(float(baseline_dnsmos.get(fname, float("nan"))))
+            n = len(abs_best)
+            if n == 0:
+                rows.append({
+                    "subset": subset_name, "K": K, "n": 0, "n_excluded": n_excluded,
+                    "mean_best_dnsmos": float("nan"), "mean_mean_dnsmos": float("nan"),
+                    "mean_impr_dnsmos": float("nan"), "p_best_gt_baseline": float("nan"),
+                    "ci_low": float("nan"), "ci_high": float("nan"),
+                })
+            else:
+                arr = np.array(abs_best)
+                local_rng = np.random.default_rng(
+                    42 + 1000 * _subset_seed.get(subset_name, 0) + K
+                )
+                ci_low, ci_high = _bootstrap_ci(arr, rng=local_rng)
+                if baselines:
+                    base_arr = np.array(baselines)
+                    valid = ~np.isnan(base_arr)
+                    mean_impr = float((arr[valid] - base_arr[valid]).mean()) if valid.sum() > 0 else float("nan")
+                    p_gt0 = float((arr[valid] > base_arr[valid]).mean()) if valid.sum() > 0 else float("nan")
+                else:
+                    mean_impr = p_gt0 = float("nan")
+                rows.append({
+                    "subset": subset_name, "K": K, "n": n, "n_excluded": n_excluded,
+                    "mean_best_dnsmos": float(arr.mean()),
+                    "mean_mean_dnsmos": float(np.mean(abs_mean)),
+                    "mean_impr_dnsmos": mean_impr,
+                    "p_best_gt_baseline": p_gt0,
+                    "ci_low": ci_low, "ci_high": ci_high,
+                })
+    return pd.DataFrame(rows)
+
+
+def collect_dnsmos(dnsmos_results: dict) -> dict[str, list[float]]:
+    """Pool all per-try non-NaN DNSMOS values for each subset (analogous to collect_sisdr)."""
+    out: dict[str, list[float]] = {}
+    for subset_name, file_scores in dnsmos_results.items():
+        d = []
+        for try_map in file_scores.values():
+            for val in try_map.values():
+                if not np.isnan(val):
+                    d.append(val)
+        out[subset_name] = d
+    return out
+
+
+def load_or_compute_baseline_dnsmos(
+    baseline_df: pd.DataFrame,
+    baseline_csv: Path,
+    baseline_enhanced_dir: Path,
+    base_metrics_cmd: str,
+    work_dir: Path,
+    test_dir: Path,
+) -> "pd.Series":
+    """Load baseline DNSMOS (dnsmos_ovrl) with fallback to compute-and-cache.
+
+    Priority:
+      1. dnsmos_ovrl already in baseline_df (filenames already normalized by caller).
+      2. work_dir/_baseline_dnsmos_cache.csv exists.
+      3. Run base_metrics_cmd --compute_dnsmos on baseline_enhanced_dir, cache result.
+    Returns an empty Series on failure.
+    """
+    # 1. Already present in the loaded baseline DataFrame
+    if "dnsmos_ovrl" in baseline_df.columns and not baseline_df["dnsmos_ovrl"].isna().all():
+        print("Baseline DNSMOS: loaded from existing baseline CSV.")
+        return baseline_df.set_index("filename")["dnsmos_ovrl"]
+
+    # 2. Cached file in work_dir
+    cache_path = work_dir / "_baseline_dnsmos_cache.csv"
+    if cache_path.exists():
+        _c = pd.read_csv(cache_path)
+        if "dnsmos_ovrl" in _c.columns and not _c["dnsmos_ovrl"].isna().all():
+            _c["filename"] = _c["filename"].apply(lambda f: normalize_fname(f, test_dir))
+            print(f"Baseline DNSMOS: loaded from cache ({cache_path}).")
+            return _c.set_index("filename")["dnsmos_ovrl"]
+
+    # 3. Compute once on baseline_enhanced_dir
+    print("Baseline DNSMOS: running calc_metrics --compute_dnsmos on baseline dir (once)...")
+    if not run(f"{base_metrics_cmd} --compute_dnsmos --enhanced_dir {baseline_enhanced_dir}"):
+        print("Warning: baseline DNSMOS computation failed; improvement stats skipped.")
+        return pd.Series(dtype=float, name="dnsmos_ovrl")
+    updated = find_results_csv(baseline_enhanced_dir)
+    if updated is None:
+        return pd.Series(dtype=float, name="dnsmos_ovrl")
+    df2 = pd.read_csv(updated)
+    if "dnsmos_ovrl" not in df2.columns:
+        return pd.Series(dtype=float, name="dnsmos_ovrl")
+    df2["filename"] = df2["filename"].apply(lambda f: normalize_fname(f, test_dir))
+    result = df2.set_index("filename")["dnsmos_ovrl"]
+    df2[["filename", "dnsmos_ovrl"]].to_csv(cache_path, index=False)
+    print(f"Baseline DNSMOS cached to {cache_path}.")
+    return result
+
+
 # ── sanity logging ────────────────────────────────────────────────────────────
 
-def log_curve_sanity(curve_df: pd.DataFrame) -> None:
+def log_curve_sanity(
+    curve_df: pd.DataFrame,
+    metric_col: str = "mean_best_sisdr",
+    metric_label: str = "mean_best_sisdr",
+) -> None:
     """Print a per-(subset, K) stats table and run monotonicity / n-consistency checks."""
-    print("\n=== Oracle Curve Sanity Check ===")
+    print(f"\n=== Oracle Curve Sanity Check ({metric_label}) ===")
 
-    hdr = f"  {'subset':<8}  {'K':>4}  {'n':>6}  {'mean_best':>10}  {'mean_mean':>10}  {'ci_low':>8}  {'ci_high':>8}"
+    hdr = f"  {'subset':<8}  {'K':>4}  {'n':>6}  {'mean_best':>10}  {'ci_low':>8}  {'ci_high':>8}"
     sep = "  " + "-" * (len(hdr) - 2)
 
     for subset_name in sorted(curve_df["subset"].unique()):
@@ -204,23 +387,22 @@ def log_curve_sanity(curve_df: pd.DataFrame) -> None:
                 return f"{v:+.3f}" if not np.isnan(v) else "      nan"
             print(
                 f"  {subset_name:<8}  {int(row['K']):>4}  {int(row['n']):>6}"
-                f"  {_fmt(row['mean_best_sisdr']):>10}"
-                f"  {_fmt(row['mean_mean_sisdr']):>10}"
+                f"  {_fmt(row[metric_col]):>10}"
                 f"  {_fmt(row['ci_low']):>8}"
                 f"  {_fmt(row['ci_high']):>8}"
             )
         print()
 
         # ── monotonicity check ────────────────────────────────────────────────
-        valid = sub.dropna(subset=["mean_best_sisdr"]).sort_values("K")
-        mb_vals = valid["mean_best_sisdr"].values
+        valid = sub.dropna(subset=[metric_col]).sort_values("K")
+        mb_vals = valid[metric_col].values
         K_vals  = valid["K"].values
         for i in range(1, len(mb_vals)):
             if mb_vals[i] < mb_vals[i - 1]:
                 print(
-                    f"  WARNING [{subset_name}]: mean_best_sisdr not monotone: "
+                    f"  WARNING [{subset_name}]: {metric_label} not monotone: "
                     f"K={int(K_vals[i-1])}→K={int(K_vals[i])}: "
-                    f"{mb_vals[i-1]:+.3f}→{mb_vals[i]:+.3f} dB"
+                    f"{mb_vals[i-1]:+.3f}→{mb_vals[i]:+.3f}"
                 )
 
         # ── n monotonicity check ──────────────────────────────────────────────
@@ -247,17 +429,17 @@ def log_curve_sanity(curve_df: pd.DataFrame) -> None:
 
 # ── fit diagnostics ───────────────────────────────────────────────────────────
 
-def fit_diagnostics(curve_df: pd.DataFrame) -> str:
-    """Fit y(K) = mean_best_sisdr vs log(K) and sqrt(log(K)) bases.
+def fit_diagnostics(curve_df: pd.DataFrame, metric_col: str = "mean_best_sisdr") -> str:
+    """Fit y(K) = metric_col vs log(K) and sqrt(log(K)) bases.
 
     Requires at least 3 distinct K values with valid data per subset.
     Returns a formatted report string.
     """
-    lines = ["=== Best-of-K Curve Fit Diagnostics ===", ""]
+    lines = [f"=== Best-of-K Curve Fit Diagnostics ({metric_col}) ===", ""]
     for subset_name in sorted(curve_df["subset"].unique()):
         sub = (
             curve_df[curve_df["subset"] == subset_name]
-            .dropna(subset=["mean_best_sisdr"])
+            .dropna(subset=[metric_col])
             .query("K >= 1")
             .sort_values("K")
         )
@@ -267,7 +449,7 @@ def fit_diagnostics(curve_df: pd.DataFrame) -> str:
             continue
 
         K_vals = sub["K"].values.astype(float)
-        y = sub["mean_best_sisdr"].values
+        y = sub[metric_col].values
         lines.append(f"Subset: {subset_name}  (n_K={len(sub)}, K={list(K_vals.astype(int))})")
 
         for label, x_feat in [
@@ -295,11 +477,21 @@ def plot_curve(
     title: str,
     save_path: Path,
     K_list: list[int],
+    extra_hlines: list[tuple[str, float]] | None = None,
 ) -> None:
+    """extra_hlines: list of (label, y_value) horizontal reference lines."""
     fig, ax = plt.subplots(figsize=(7, 5))
+    _colors: dict[str, str] = {}
     for subset_name in sorted(curve_df["subset"].unique()):
         sub = curve_df[curve_df["subset"] == subset_name].sort_values("K")
-        ax.plot(sub["K"], sub[metric_col], marker="o", label=subset_name)
+        (line,) = ax.plot(sub["K"], sub[metric_col], marker="o", label=subset_name)
+        _colors[subset_name] = line.get_color()
+    if extra_hlines:
+        for label, y_val in extra_hlines:
+            if not np.isnan(float(y_val)):
+                # reuse the same color as the matching subset curve
+                col = _colors.get(label.split(" ")[0])
+                ax.axhline(float(y_val), linestyle="--", color=col, label=label, alpha=0.8)
     if _use_logx(K_list):
         ax.set_xscale("log")
     ax.set_xlabel("K (number of tries)")
@@ -330,6 +522,28 @@ def plot_sisdr_hist(sisdr_vals: list[float], subset_name: str, save_path: Path) 
     print(f"Saved: {save_path}")
 
 
+def plot_dnsmos_hist(
+    pooled_dnsmos: list[float],
+    baseline_dnsmos_vals: "list[float] | None",
+    subset_name: str,
+    save_path: Path,
+) -> None:
+    """Histogram of per-try DNSMOS for one subset, with optional baseline overlay."""
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(pooled_dnsmos, bins=30, edgecolor="black", alpha=0.7,
+            label=f"per-try DNSMOS (n={len(pooled_dnsmos)})")
+    if baseline_dnsmos_vals:
+        ax.hist(baseline_dnsmos_vals, bins=30, edgecolor="black", alpha=0.55,
+                color="orange", label=f"baseline DNSMOS (n={len(baseline_dnsmos_vals)})")
+    ax.set_xlabel("DNSMOS overall MOS")
+    ax.set_ylabel("Count")
+    ax.set_title(f"DNSMOS distribution — {subset_name}")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved: {save_path}")
+
 
 def plot_worst_sweep_curve(
     summary_df: pd.DataFrame,
@@ -338,13 +552,16 @@ def plot_worst_sweep_curve(
     save_path: Path,
     baseline_all_sisdr: pd.Series | None = None,
     K: int | None = None,
+    ylabel: str = "SI-SDR (enhanced vs clean, dB)",
+    plot_title: str | None = None,
+    metric_name: str = "SI-SDR",
+    baseline_metric: "pd.Series | None" = None,
 ) -> None:
-    """Plot mean best_of_K, mean_of_K, and baseline SI-SDR vs worst-x% cutoff.
+    """Plot mean best_of_K, mean_of_K, and baseline metric vs worst-x% cutoff.
 
-    If baseline_all_sisdr is provided (full test-set baseline), x% is taken
-    relative to ALL test files ranked by baseline SI-SDR ascending.  Only x
-    values for which every selected file has resampling data are plotted, so
-    the curve naturally extends up to q_percent.
+    baseline_all_sisdr controls the ranking of files (x-axis: worst x% by this
+    metric).  baseline_metric, if provided, supplies the y-axis baseline values
+    (useful when ranking by SI-SDR but plotting DNSMOS scores).
 
     If K is provided, best_of_K and mean_of_K are computed from try_0..try_{K-1}
     columns (capped at available tries).  Otherwise the precomputed best_of_K /
@@ -391,7 +608,9 @@ def plot_worst_sweep_curve(
             continue
         group_best = sub_indexed.loc[group_fnames, "_best"]
         group_mean = sub_indexed.loc[group_fnames, "_mean"]
-        if baseline_all_sisdr is not None:
+        if baseline_metric is not None:
+            group_base = baseline_metric[group_fnames]
+        elif baseline_all_sisdr is not None:
             group_base = baseline_all_sisdr[group_fnames]
         else:
             group_base = sub_indexed.loc[group_fnames, "baseline_sisdr_enh"]
@@ -406,13 +625,14 @@ def plot_worst_sweep_curve(
         return
 
     K_label = f"K={K_actual}" if K_actual is not None else "K=max"
+    _title = plot_title if plot_title is not None else f"Oracle resampling — worst-x% of test set ({K_label})"
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.plot(x_vals, y_best, marker="o", label=f"best_of_K ({K_label})")
     ax.plot(x_vals, y_mean, marker="s", label=f"mean_of_K ({K_label})")
     ax.plot(x_vals, y_base, marker="^", linestyle="--", label="baseline")
     ax.set_xlabel("Worst subset size (% of full test set)")
-    ax.set_ylabel("SI-SDR (enhanced vs clean, dB)")
-    ax.set_title(f"Oracle resampling — worst-x% of test set ({K_label})")
+    ax.set_ylabel(ylabel)
+    ax.set_title(_title)
     ax.set_xticks(x_vals)
     ax.legend()
     ax.grid(True, alpha=0.4)
@@ -427,7 +647,7 @@ def plot_worst_sweep_curve(
     header = (f"{'worst_%':>{col_w}}  {'n_files':>{col_w}}"
               f"  {'baseline':>{col_w}}  {'best_of_K':>{col_w}}  {'mean_of_K':>{col_w}}")
     sep = "  ".join(["-" * col_w] * 5)
-    lines = [f"# worst_sweep_curve — {subset_name}  ({K_label})", header, sep]
+    lines = [f"# worst_sweep_curve ({metric_name}) — {subset_name}  ({K_label})", header, sep]
     for x, n, yb, ym, ybase in zip(x_vals, n_vals, y_best, y_mean, y_base):
         lines.append(
             f"{x:>{col_w}.1f}  {n:>{col_w}d}"
@@ -435,6 +655,28 @@ def plot_worst_sweep_curve(
         )
     txt_path.write_text("\n".join(lines) + "\n")
     print(f"Saved: {txt_path}")
+
+
+def build_dnsmos_summary_df(dnsmos_results: dict, K_max: int) -> pd.DataFrame:
+    """Build a per-file DNSMOS summary DataFrame (same shape as oracle_summary.csv).
+
+    Columns: filename, subset, best_of_K, mean_of_K, try_0..try_{K_max-1}
+    Values are DNSMOS overall MOS scores.
+    """
+    rows = []
+    for subset_name, file_scores in dnsmos_results.items():
+        for fname, try_map in file_scores.items():
+            vals = [try_map[t] for t in range(K_max)
+                    if t in try_map and not np.isnan(try_map.get(t, float("nan")))]
+            if not vals:
+                continue
+            row: dict = {"filename": fname, "subset": subset_name,
+                         "best_of_K": float(np.max(vals)),
+                         "mean_of_K": float(np.mean(vals))}
+            for t in range(K_max):
+                row[f"try_{t}"] = try_map.get(t, float("nan"))
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -458,6 +700,9 @@ def main():
                         help="Full enhancement.py command (without --enhanced_dir / --file_list / --gate_seed)")
     parser.add_argument("--metrics_cmd", required=True,
                         help="Full calc_metrics.py command (without --enhanced_dir)")
+    parser.add_argument("--enable_dnsmos_oracle", action="store_true", default=False,
+                        help="Compute DNSMOS per try and report DNSMOS-oracle SI-SDR improvement. "
+                             "Automatically appends --compute_dnsmos to the metrics command.")
     args = parser.parse_args()
 
     # Resolve K_list and K_max
@@ -479,23 +724,44 @@ def main():
     if baseline_csv is None:
         sys.exit(f"Error: no *_results.csv found in {baseline_dir}")
     baseline_df = pd.read_csv(baseline_csv)
-    if "filename" not in baseline_df.columns or "si_sdr" not in baseline_df.columns:
-        sys.exit("Error: baseline CSV must contain 'filename' and 'si_sdr' columns")
+    if "filename" not in baseline_df.columns or "sisdr_enh" not in baseline_df.columns:
+        sys.exit("Error: baseline CSV must contain 'filename' and 'sisdr_enh' columns")
     baseline_df["filename"] = baseline_df["filename"].apply(
         lambda f: normalize_fname(f, test_dir))
-    baseline_sisdr = baseline_df.set_index("filename")["si_sdr"]
+    baseline_sisdr = baseline_df.set_index("filename")["sisdr_enh"]
     print(f"Loaded baseline: {len(baseline_sisdr)} files from {baseline_csv}")
 
+    # ── 1b. Baseline DNSMOS (loaded/computed when DNSMOS oracle is enabled) ───
+    baseline_dnsmos: "pd.Series | None" = None
+    if args.enable_dnsmos_oracle:
+        baseline_dnsmos = load_or_compute_baseline_dnsmos(
+            baseline_df, baseline_csv, baseline_dir, args.metrics_cmd, work_dir, test_dir
+        )
+        if len(baseline_dnsmos) == 0 or baseline_dnsmos.isna().all():
+            print("Warning: baseline DNSMOS unavailable; DNSMOS improvement stats will be skipped.")
+            baseline_dnsmos = None
+        else:
+            print(f"Baseline DNSMOS: {(~baseline_dnsmos.isna()).sum()} valid files.")
+
     # ── 2. Worst-q% subset ───────────────────────────────────────────────────
-    n_select = max(1, int(np.ceil(len(baseline_sisdr) * args.q_percent / 100)))
-    worst_files = baseline_sisdr.sort_values().head(n_select).index.tolist()
+    # When DNSMOS flag is active and baseline DNSMOS is available, select worst
+    # files by lowest DNSMOS (consistent with DNSMOS-based plots).
+    # Fall back to SI-SDR ranking if DNSMOS is unavailable.
+    if args.enable_dnsmos_oracle and baseline_dnsmos is not None:
+        _ranking = baseline_dnsmos.dropna()
+        _ranking_label = "DNSMOS"
+    else:
+        _ranking = baseline_sisdr
+        _ranking_label = "SI-SDR"
+    n_select = max(1, int(np.ceil(len(_ranking) * args.q_percent / 100)))
+    worst_files = _ranking.sort_values().head(n_select).index.tolist()
     worst_txt = work_dir / "worst.txt"
     worst_txt.write_text("\n".join(worst_files) + "\n")
-    print(f"Worst {args.q_percent}%: {n_select} files → {worst_txt}")
+    print(f"Worst {args.q_percent}% by {_ranking_label}: {n_select} files → {worst_txt}")
 
     # ── 3. Random subset of equal size ───────────────────────────────────────
     rng = random.Random(1234)
-    random_files = rng.sample(baseline_sisdr.index.tolist(), n_select)
+    random_files = rng.sample(_ranking.index.tolist(), n_select)
     random_txt = work_dir / "random.txt"
     random_txt.write_text("\n".join(random_files) + "\n")
     print(f"Random subset:  {n_select} files → {random_txt}")
@@ -506,6 +772,16 @@ def main():
         "worst":  {f: {} for f in worst_files},
         "random": {f: {} for f in random_files},
     }
+    # dnsmos_results[subset][fname][try_idx] = dnsmos_ovrl (may be NaN)
+    dnsmos_results: dict[str, dict[str, dict[int, float]]] = (
+        {"worst": {f: {} for f in worst_files}, "random": {f: {} for f in random_files}}
+        if args.enable_dnsmos_oracle else {}
+    )
+    # Append --compute_dnsmos to metrics command when DNSMOS oracle is requested.
+    # Guard against double-appending if the user already included it in --metrics_cmd.
+    _metrics_cmd = args.metrics_cmd
+    if args.enable_dnsmos_oracle and "--compute_dnsmos" not in args.metrics_cmd:
+        _metrics_cmd += " --compute_dnsmos"
     # Separate seed offsets so worst/random seed streams never collide
     seed_offsets = {"worst": 0, "random": 10_000}
     file_lists   = {"worst": worst_txt, "random": random_txt}
@@ -522,7 +798,7 @@ def main():
                        f"--gate_seed {seed}"):
                 continue
 
-            if not run(f"{args.metrics_cmd} --enhanced_dir {enh_dir}"):
+            if not run(f"{_metrics_cmd} --enhanced_dir {enh_dir}"):
                 continue
 
             csv_path = find_results_csv(enh_dir)
@@ -536,6 +812,27 @@ def main():
                     results[subset_name][fname][t] = float(attempt_sisdr[fname])
                 else:
                     print(f"Warning: {fname} missing from {enh_dir} results")
+            if args.enable_dnsmos_oracle:
+                attempt_dnsmos = load_dnsmos(csv_path)
+                for fname in dnsmos_results[subset_name]:
+                    if fname in attempt_dnsmos.index:
+                        dnsmos_results[subset_name][fname][t] = float(attempt_dnsmos[fname])
+
+    # Compute DNSMOS oracle once (before summaries so columns are available)
+    _dns_oracle: dict = {}
+    if args.enable_dnsmos_oracle:
+        _dns_oracle = compute_dnsmos_oracle(results, dnsmos_results, baseline_sisdr)
+
+    # Compute DNSMOS curve stats (absolute best/mean DNSMOS vs K)
+    _dnsmos_curve_df: "pd.DataFrame | None" = None
+    if args.enable_dnsmos_oracle and dnsmos_results:
+        _dnsmos_curve_df = compute_dnsmos_curve_stats(dnsmos_results, K_list, baseline_dnsmos)
+        for _sn in ["worst", "random"]:
+            _ne_rows = _dnsmos_curve_df[_dnsmos_curve_df["subset"] == _sn]["n_excluded"]
+            if len(_ne_rows) > 0:
+                _ne = int(_ne_rows.max())
+                if _ne > 0:
+                    print(f"DNSMOS: {_ne} file(s) excluded from [{_sn}] subset (all-NaN across tries).")
 
     # ── 5. Oracle summary CSV (one row per file × subset) ────────────────────
     # Columns: filename, subset, baseline_sisdr_enh, best_of_K, mean_of_K, try_0..K-1
@@ -569,13 +866,36 @@ def main():
         sub = summary_df[summary_df["subset"] == subset_name]
         if sub.empty:
             continue
+        _d = _dns_oracle.get(subset_name, {})
+        _imps = np.array(_d.get("improvements", []))
+        sub_files = sub["filename"].tolist()
+
+        # DNSMOS stats at K_max from curve df
+        _dns_kmax_row = None
+        if _dnsmos_curve_df is not None:
+            _mask = (_dnsmos_curve_df["subset"] == subset_name) & (_dnsmos_curve_df["K"] == K_max)
+            _match = _dnsmos_curve_df[_mask]
+            if len(_match) > 0:
+                _dns_kmax_row = _match.iloc[0]
+        _mean_bl_dns = (
+            float(baseline_dnsmos[baseline_dnsmos.index.isin(sub_files)].mean())
+            if baseline_dnsmos is not None else float("nan")
+        )
+
         abs_summary_rows.append({
-            "subset":                  subset_name,
-            "n_files":                 sub["filename"].nunique(),
-            "K":                       _K_inferred,
-            "mean_baseline_sisdr_enh": round(float(sub["baseline_sisdr_enh"].mean()), 4),
-            "mean_best_of_K":          round(float(sub["best_of_K"].mean()), 4),
-            "mean_mean_of_K":          round(float(sub["mean_of_K"].mean()), 4),
+            "subset":                    subset_name,
+            "n_files":                   sub["filename"].nunique(),
+            "K":                         _K_inferred,
+            "mean_baseline_sisdr_enh":   round(float(sub["baseline_sisdr_enh"].mean()), 4),
+            "mean_best_of_K":            round(float(sub["best_of_K"].mean()), 4),
+            "mean_mean_of_K":            round(float(sub["mean_of_K"].mean()), 4),
+            "dnsmos_oracle_improvement": round(float(_imps.mean()), 4) if len(_imps) > 0 else float("nan"),
+            "dnsmos_oracle_p_gt0":       round(float((_imps > 0).mean()), 4) if len(_imps) > 0 else float("nan"),
+            "dnsmos_oracle_n_fallback":  int(_d.get("n_fallback", 0)) if args.enable_dnsmos_oracle else None,
+            "mean_baseline_dnsmos":      round(_mean_bl_dns, 4) if not np.isnan(_mean_bl_dns) else float("nan"),
+            "mean_best_of_K_dnsmos":     round(float(_dns_kmax_row["mean_best_dnsmos"]), 4) if _dns_kmax_row is not None else float("nan"),
+            "mean_mean_of_K_dnsmos":     round(float(_dns_kmax_row["mean_mean_dnsmos"]), 4) if _dns_kmax_row is not None else float("nan"),
+            "dnsmos_best_p_gt0":         round(float(_dns_kmax_row["p_best_gt_baseline"]), 4) if _dns_kmax_row is not None else float("nan"),
         })
     abs_summary_path = work_dir / "oracle_absolute_summary.csv"
     pd.DataFrame(abs_summary_rows).to_csv(abs_summary_path, index=False)
@@ -594,42 +914,148 @@ def main():
             f"  {r['mean_mean_of_K']:>15.2f}"
         )
 
+    if args.enable_dnsmos_oracle and _dns_oracle:
+        print("\n=== DNSMOS Oracle SI-SDR (selected by max dnsmos_ovrl) ===\n")
+        _hdr2 = (f"  {'subset':<8}  {'n':>6}  {'mean_impr (dB)':>15}"
+                 f"  {'P(>0)':>8}  {'n_fallback':>12}")
+        print(_hdr2)
+        print("  " + "-" * (len(_hdr2) - 2))
+        for subset_name in ["worst", "random"]:
+            _d = _dns_oracle.get(subset_name, {})
+            _imps = np.array(_d.get("improvements", []))
+            _nfb = _d.get("n_fallback", 0)
+            if len(_imps) == 0:
+                print(f"  {subset_name:<8}  {'—':>6}  {'no data':>15}")
+                continue
+            print(
+                f"  {subset_name:<8}  {len(_imps):>6}"
+                f"  {float(_imps.mean()):>15.3f}"
+                f"  {float((_imps > 0).mean()):>8.3f}"
+                f"  {_nfb:>12}"
+            )
+
+    if args.enable_dnsmos_oracle and _dnsmos_curve_df is not None:
+        _dns_has_data = not _dnsmos_curve_df["mean_best_dnsmos"].isna().all()
+        if _dns_has_data:
+            print("\n=== Oracle Resampling Results (DNSMOS overall MOS, absolute) ===\n")
+            _hdr3 = (f"  {'subset':<8}  {'n':>6}  {'K':>4}  {'baseline MOS':>14}"
+                     f"  {'best_of_K MOS':>14}  {'mean_of_K MOS':>14}  {'P(best>base)':>13}")
+            print(_hdr3)
+            print("  " + "-" * (len(_hdr3) - 2))
+            for r in abs_summary_rows:
+                _mbd = r.get("mean_best_of_K_dnsmos", float("nan"))
+                if np.isnan(_mbd):
+                    continue
+                _bl_s  = f"{r['mean_baseline_dnsmos']:.3f}" if not np.isnan(r.get("mean_baseline_dnsmos", float("nan"))) else "  n/a"
+                _p_s   = f"{r['dnsmos_best_p_gt0']:.3f}" if not np.isnan(r.get("dnsmos_best_p_gt0", float("nan"))) else "  n/a"
+                print(
+                    f"  {r['subset']:<8}  {r['n_files']:>6}  {r['K']:>4}"
+                    f"  {_bl_s:>14}"
+                    f"  {_mbd:>14.3f}"
+                    f"  {r['mean_mean_of_K_dnsmos']:>14.3f}"
+                    f"  {_p_s:>13}"
+                )
+        else:
+            print("\nDNSMOS absolute results: all values NaN (speechmos may be missing).")
+
     # ── 7. Oracle curve stats (one row per subset × K) ────────────────────────
     curve_df = compute_curve_stats(results, baseline_sisdr, K_list)
     curve_path = work_dir / "oracle_curve.csv"
     curve_df.to_csv(curve_path, index=False)
     print(f"\nOracle curve saved to {curve_path}")
-    log_curve_sanity(curve_df)
+
+    if _dnsmos_curve_df is not None:
+        dnsmos_curve_path = work_dir / "oracle_dnsmos_curve.csv"
+        _dnsmos_curve_df.to_csv(dnsmos_curve_path, index=False)
+        print(f"DNSMOS oracle curve saved to {dnsmos_curve_path}")
+
+    # Sanity check on the primary metric curve
+    if args.enable_dnsmos_oracle and _dnsmos_curve_df is not None:
+        log_curve_sanity(_dnsmos_curve_df, metric_col="mean_best_dnsmos", metric_label="mean_best_dnsmos")
+    else:
+        log_curve_sanity(curve_df)
 
     # ── 8. Plots ──────────────────────────────────────────────────────────────
-    if len(K_list) >= 2:
-        plot_curve(
-            curve_df, "mean_improvement_best",
-            "Mean best-of-K improvement over single-sample baseline (dB)",
-            "Oracle gain: best-of-K SI-SDR(enh,clean) − SI-SDR(baseline,clean)",
-            plots_dir / "best_of_K_vs_K.png", K_list,
-        )
-    else:
-        print("Skipping curve plots (need at least 2 K values).")
+    if not args.enable_dnsmos_oracle:
+        # SI-SDR plots — skipped when DNSMOS flag is active (DNSMOS plots replace them)
+        if len(K_list) >= 2:
+            plot_curve(
+                curve_df, "mean_improvement_best",
+                "Mean best-of-K improvement over single-sample baseline (dB)",
+                "Oracle gain: best-of-K SI-SDR(enh,clean) − SI-SDR(baseline,clean)",
+                plots_dir / "best_of_K_vs_K.png", K_list,
+            )
+        else:
+            print("Skipping curve plots (need at least 2 K values).")
 
-    all_sisdr = collect_sisdr(results)
-    for subset_name, sisdr_vals in all_sisdr.items():
-        if not sisdr_vals:
-            print(f"Warning: no sisdr values for {subset_name}, skipping histogram.")
-            continue
-        plot_sisdr_hist(sisdr_vals, subset_name, plots_dir / f"sisdr_hist_{subset_name}.png")
+        all_sisdr = collect_sisdr(results)
+        for subset_name, sisdr_vals in all_sisdr.items():
+            if not sisdr_vals:
+                print(f"Warning: no sisdr values for {subset_name}, skipping histogram.")
+                continue
+            plot_sisdr_hist(sisdr_vals, subset_name, plots_dir / f"sisdr_hist_{subset_name}.png")
+
+    # ── DNSMOS plots (replace SI-SDR plots when flag is active) ──────────────
+    if args.enable_dnsmos_oracle and _dnsmos_curve_df is not None and len(K_list) >= 2:
+        if not _dnsmos_curve_df["mean_best_dnsmos"].isna().all():
+            plot_curve(
+                _dnsmos_curve_df, "mean_best_dnsmos",
+                "Mean best-of-K DNSMOS (MOS)",
+                "Oracle DNSMOS: best-of-K overall MOS vs K",
+                plots_dir / "best_of_K_vs_K_dnsmos.png", K_list,
+            )
+            plot_curve(
+                _dnsmos_curve_df, "mean_mean_dnsmos",
+                "Mean mean-of-K DNSMOS (MOS)",
+                "DNSMOS: mean-of-K overall MOS vs K",
+                plots_dir / "mean_of_K_vs_K_dnsmos.png", K_list,
+            )
+        else:
+            print("Skipping DNSMOS curve plots (all NaN; speechmos may be missing).")
+
+    if args.enable_dnsmos_oracle and dnsmos_results:
+        all_dnsmos = collect_dnsmos(dnsmos_results)
+        for subset_name, dnsmos_vals in all_dnsmos.items():
+            if not dnsmos_vals:
+                print(f"Warning: no DNSMOS values for {subset_name}, skipping DNSMOS histogram.")
+                continue
+            _sub_files = worst_files if subset_name == "worst" else random_files
+            _bl_vals = None
+            if baseline_dnsmos is not None:
+                _bl_s = baseline_dnsmos[baseline_dnsmos.index.isin(_sub_files)].dropna()
+                _bl_vals = _bl_s.tolist() if len(_bl_s) > 0 else None
+            plot_dnsmos_hist(
+                dnsmos_vals, _bl_vals, subset_name,
+                plots_dir / f"dnsmos_hist_{subset_name}.png",
+            )
 
     _X_pct = [2, 5, 10, 15, 20, 25, 30, 35, 40, 45]
-    plot_worst_sweep_curve(
-        summary_df, "worst", _X_pct,
-        plots_dir / "worst_sweep_curve_worst.png",
-        baseline_all_sisdr=baseline_sisdr,
-        K=K_max,
-    )
+    if args.enable_dnsmos_oracle and dnsmos_results and baseline_dnsmos is not None:
+        _dnsmos_summary_df = build_dnsmos_summary_df(dnsmos_results, K_max)
+        if not _dnsmos_summary_df.empty:
+            plot_worst_sweep_curve(
+                _dnsmos_summary_df, "worst", _X_pct,
+                plots_dir / "worst_sweep_curve_worst_dnsmos.png",
+                baseline_all_sisdr=baseline_dnsmos,  # rank by DNSMOS (consistent with file selection)
+                K=K_max,
+                ylabel="DNSMOS overall MOS",
+                plot_title=f"Oracle DNSMOS resampling — worst-x% of test set (K={K_max})",
+                metric_name="DNSMOS",
+            )
+    else:
+        plot_worst_sweep_curve(
+            summary_df, "worst", _X_pct,
+            plots_dir / "worst_sweep_curve_worst.png",
+            baseline_all_sisdr=baseline_sisdr,
+            K=K_max,
+        )
 
     # ── 9. Fit diagnostics ────────────────────────────────────────────────────
     if len(K_list) >= 3:
-        report = fit_diagnostics(curve_df)
+        if args.enable_dnsmos_oracle and _dnsmos_curve_df is not None:
+            report = fit_diagnostics(_dnsmos_curve_df, metric_col="mean_best_dnsmos")
+        else:
+            report = fit_diagnostics(curve_df)
         print(f"\n{report}")
         fit_path = work_dir / "fit_report.txt"
         fit_path.write_text(report)
