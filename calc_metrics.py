@@ -35,24 +35,16 @@ def sisdr(est: np.ndarray, ref: np.ndarray) -> float:
     return float(10.0 * np.log10(np.dot(s_target, s_target) / np.dot(e_noise, e_noise)))
 
 
-def _to_16k(audio: np.ndarray, sr: int) -> np.ndarray:
-    """Resample *audio* to 16 kHz, collapse to mono, return float32.
-
-    soundfile returns [T, channels] for multi-channel files; squeeze to 1-D
-    before resampling so DNSMOS always receives a flat array.
-    """
-    audio = np.asarray(audio, dtype=np.float32)
-    if audio.ndim == 2:          # [T, channels] → mono by averaging
-        audio = audio.mean(axis=1)
-    if sr == 16000:
-        return audio
-    try:
-        from math import gcd
-        from scipy.signal import resample_poly
-        g = gcd(16000, sr)
-        return resample_poly(audio, 16000 // g, sr // g).astype(np.float32)
-    except ImportError:
-        # librosa is already a project dependency — use as fallback
+try:
+    from utils.dnsmos_helper import to_16k as _to_16k
+except ImportError:
+    # fallback if run without utils/ on path
+    def _to_16k(audio: np.ndarray, sr: int) -> np.ndarray:
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        if sr == 16000:
+            return audio
         return librosa.resample(audio, orig_sr=sr, target_sr=16000)
 
 
