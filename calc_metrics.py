@@ -137,7 +137,11 @@ if __name__ == '__main__':
 
     # Save average results to file
     log = open(join(args.enhanced_dir, "_avg_results.txt"), "w")
+    log.write("PESQ: {:.2f} ± {:.2f}".format(*mean_std(df["pesq"].to_numpy())) + "\n")
+    log.write("ESTOI: {:.2f} ± {:.2f}".format(*mean_std(df["estoi"].to_numpy())) + "\n")
     log.write("SI-SDR: {:.1f} ± {:.2f}".format(*mean_std(df["sisdr_enh"].to_numpy())) + "\n")
+    log.write("SI-SIR: {:.1f} ± {:.2f}".format(*mean_std(df["si_sir"].to_numpy())) + "\n")
+    log.write("SI-SAR: {:.1f} ± {:.2f}".format(*mean_std(df["si_sar"].to_numpy())) + "\n")
     if _dnsmos_enabled:
         log.write(f"DNSMOS: {dns_mean:.3f} ± {dns_std:.3f}\n")
 
