@@ -233,7 +233,14 @@ def main():
     from scipy.stats import spearmanr
 
     final_col = f"dnsmos_step_{final_step:03d}"
-    valid_final = df[["filename", final_col]].dropna()
+    # Use a sentinel name for the final-step column in merges to avoid pandas
+    # column-name collision (dnsmos_step_029_x / _y) when k == final_step.
+    _FINAL_SENTINEL = "__final_dnsmos"
+    valid_final = (
+        df[["filename", final_col]]
+        .dropna()
+        .rename(columns={final_col: _FINAL_SENTINEL})
+    )
 
     print(
         f"\nFinal step {final_step:03d}: {len(valid_final)} files with scores. "
@@ -267,7 +274,7 @@ def main():
         # ceil ensures at least 1 file even for tiny common sets.
         n_worst_common   = max(1, int(np.ceil(n_common * args.q_percent / 100)))
         worst_k          = set(common.nsmallest(n_worst_common, col)["filename"])
-        worst_final_here = set(common.nsmallest(n_worst_common, final_col)["filename"])
+        worst_final_here = set(common.nsmallest(n_worst_common, _FINAL_SENTINEL)["filename"])
 
         intersect = len(worst_k & worst_final_here)
         recall    = intersect / len(worst_final_here) if worst_final_here else float("nan")
@@ -278,7 +285,7 @@ def main():
             else float("nan")
         )
 
-        sp_r, _ = spearmanr(common[col].values, common[final_col].values)
+        sp_r, _ = spearmanr(common[col].values, common[_FINAL_SENTINEL].values)
 
         records.append(
             dict(
