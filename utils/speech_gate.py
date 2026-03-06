@@ -114,17 +114,119 @@ def gate_step_score(step_info: dict, cache: dict) -> float:
     return leakage_num / leakage_den
 
 
+def gate_step_wiener_residual(step_info: dict, cache: dict) -> float:
+    """Per-step Wiener-residual gate — reference-free SI-SDR proxy.
+
+    Estimates noise PSD from VAD-off (non-speech) frames via median across time,
+    then computes the ratio of residual (noise-like) energy to speech-excess
+    energy during speech frames.  Higher score = more noise leaking through =
+    worse enhancement.
+
+    step_info keys (used):
+        xt_mean : torch.Tensor [B, C, F, T_spec] — denoised latent estimate
+
+    cache keys (used):
+        speech_mask_frames : np.ndarray [T_spec], bool — True = speech frame
+        eps                : float (default 1e-8)
+        wiener_alpha       : float (default 1.0) — noise over-subtraction factor
+
+    Returns:
+        float: E_resid / (E_speech + eps) — higher = worse.
+               Returns 0.0 on edge cases (too few speech/non-speech frames).
+    """
+    xt_mean = step_info["xt_mean"]        # [B, C, F, T_spec]
+    mask    = cache["speech_mask_frames"] # [T_spec] bool, CPU numpy
+    eps     = cache.get("eps", 1e-8)
+    alpha   = cache.get("wiener_alpha", 1.0)
+
+    # Power spectrogram for batch item 0, sum over C → [F, T_spec].  Single .cpu() call.
+    S = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()  # [F, T_spec]
+
+    # Align lengths.
+    T = min(S.shape[1], len(mask))
+    S    = S[:, :T]
+    mask = mask[:T]
+
+    non = ~mask
+    if non.sum() < 5 or mask.sum() < 10:
+        return 0.0
+
+    # Noise PSD estimate from non-speech frames (median over time).
+    N_f = np.median(S[:, non], axis=1)   # [F]
+    N_f = np.maximum(N_f, eps)
+
+    # Speech-excess and residual energy during speech frames.
+    S_speech   = S[:, mask]                                         # [F, N_speech]
+    speech_est = np.maximum(S_speech - alpha * N_f[:, None], 0.0)
+    resid_est  = np.minimum(S_speech, alpha * N_f[:, None])
+
+    E_speech = float(speech_est.sum())
+    E_resid  = float(resid_est.sum())
+
+    score = E_resid / (E_speech + eps)
+    return min(score, 1e6)
+
+
+def gate_step_stft_leakage(step_info: dict, cache: dict) -> float:
+    """Per-step non-speech/speech frame-power ratio on the TF spectrogram.
+
+    Sum power over frequency bins to get a per-frame scalar, then return
+    mean(non-speech frames) / mean(speech frames).  Identical formula to
+    the post-hoc _stft_leakage_score in leakage_best_of_k_eval.py.
+    Higher = more energy leaking into silence = worse.
+
+    step_info keys (used):
+        xt_mean : torch.Tensor [B, C, F, T_spec] — denoised latent estimate
+
+    cache keys (used):
+        speech_mask_frames : np.ndarray [T_spec], bool — True = speech frame
+        eps                : float (default 1e-8)
+
+    Returns:
+        float: mean_power(non-speech) / mean_power(speech) — higher = worse.
+               Returns 0.0 on edge cases (no speech or non-speech frames).
+    """
+    xt_mean = step_info["xt_mean"]        # [B, C, F, T_spec]
+    mask    = cache["speech_mask_frames"] # [T_spec] bool, CPU numpy
+    eps     = cache.get("eps", 1e-8)
+
+    # Sum power over channels and frequency → per-frame scalar [T_spec].  Single .cpu() call.
+    frame_power = (xt_mean[0].abs() ** 2).sum(dim=(0, 1)).detach().cpu().numpy()  # [T_spec]
+
+    T = min(len(frame_power), len(mask))
+    fp   = frame_power[:T]
+    mask = mask[:T]
+
+    non = ~mask
+    if not mask.any() or not non.any():
+        return 0.0
+
+    return float(np.mean(fp[non])) / (float(np.mean(fp[mask])) + eps)
+
+
 def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> dict:
     """Return {gate_name: score} for each requested gate at this diffusion step.
 
-    Currently only "leakage" is implemented.  Adding a new gate requires
-    registering it in the if/elif chain below.
+    Supported gates:
+        "leakage"          — non-speech-to-speech frame-power ratio (reference-free).
+        "wiener_residual"  — Wiener-like residual-to-speech-excess energy ratio over
+                             speech frames; reference-free SI-SDR proxy.
+                             Higher = more noise leaking through = worse.
+        "stft_leakage"     — Simple non-speech/speech frame-power ratio on the TF
+                             spectrogram (sum over F then mean per region).  Matches
+                             the post-hoc _stft_leakage_score exactly.
+                             Higher = more leakage = worse.
+
+    Adding a new gate requires registering it in the if/elif chain below.
     """
     scores = {}
     for gate in gates:
         if gate == "leakage":
             scores["leakage"] = gate_step_score(step_info, cache)
-        # future: elif gate == "distortion": scores["distortion"] = ...
+        elif gate == "wiener_residual":
+            scores["wiener_residual"] = gate_step_wiener_residual(step_info, cache)
+        elif gate == "stft_leakage":
+            scores["stft_leakage"] = gate_step_stft_leakage(step_info, cache)
     return scores
 
 
@@ -253,3 +355,146 @@ class GateTrajectoryLog:
             if self.t_k is None:
                 self.t_k = []
             self.t_k.append(float(t))
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc gate score functions
+# Exact copies of the helpers in leakage_best_of_k_eval.py — lower = worse.
+# ---------------------------------------------------------------------------
+
+_VAD_WINDOW = 400  # samples
+
+
+def _speech_mask(y: np.ndarray, percentile: float = 80.0) -> np.ndarray:
+    """Energy-based VAD mask on the noisy signal."""
+    energy = np.convolve(y ** 2, np.ones(_VAD_WINDOW) / _VAD_WINDOW, mode="same")
+    return energy > np.percentile(energy, percentile)
+
+
+def _stft_leakage_score(y: np.ndarray, x_hat: np.ndarray) -> float:
+    """Post-hoc STFT frame-power leakage gate.  Lower = better.
+
+    Computes STFT of the enhanced signal, sums power over frequency bins to get
+    a per-frame scalar, then returns mean(non-speech) / mean(speech).
+    Identical formula to gate_step_stft_leakage above.
+    """
+    import librosa
+
+    _EPS  = 1e-8
+    N_FFT = 512
+    HOP   = 128
+
+    T = min(len(y), len(x_hat))
+    y     = np.asarray(y[:T],     dtype=np.float32)
+    x_hat = np.asarray(x_hat[:T], dtype=np.float32)
+
+    speech_mask_samples = _speech_mask(y)
+    win = np.hanning(N_FFT).astype(np.float32)
+    S   = np.abs(librosa.stft(x_hat, n_fft=N_FFT, hop_length=HOP,
+                               win_length=N_FFT, window=win)) ** 2  # [F, T_frames]
+
+    # Per-frame power: sum over frequency bins
+    fp = S.sum(axis=0)  # [T_frames]
+
+    # Convert sample-level mask → frame-level
+    n_frames   = fp.shape[0]
+    frame_mask = np.zeros(n_frames, dtype=bool)
+    for t in range(n_frames):
+        start = t * HOP
+        end   = min(start + N_FFT, len(speech_mask_samples))
+        if start < len(speech_mask_samples):
+            frame_mask[t] = np.mean(speech_mask_samples[start:end]) > 0.5
+
+    non_mask = ~frame_mask
+    if not frame_mask.any() or not non_mask.any():
+        return 0.0
+
+    return float(np.mean(fp[non_mask])) / (float(np.mean(fp[frame_mask])) + _EPS)
+
+
+def _wiener_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
+    """Post-hoc Wiener residual gate.  Lower = better.
+
+    Estimates noise PSD from non-speech frames (median across time), then
+    computes the ratio of residual (noise-like) energy to speech-excess energy
+    over speech frames.  High values = more noise leaking through = worse.
+    """
+    import librosa
+
+    _EPS   = 1e-8
+    N_FFT  = 512
+    HOP    = 128
+
+    T = min(len(y), len(x_hat))
+    y     = np.asarray(y[:T],     dtype=np.float32)
+    x_hat = np.asarray(x_hat[:T], dtype=np.float32)
+
+    speech_mask_samples = _speech_mask(y)
+    win = np.hanning(N_FFT).astype(np.float32)
+    S   = np.abs(librosa.stft(x_hat, n_fft=N_FFT, hop_length=HOP,
+                               win_length=N_FFT, window=win)) ** 2  # [F, T_frames]
+
+    # Convert sample-level mask → frame-level
+    n_frames   = S.shape[1]
+    frame_mask = np.zeros(n_frames, dtype=bool)
+    for t in range(n_frames):
+        start = t * HOP
+        end   = min(start + N_FFT, len(speech_mask_samples))
+        if start < len(speech_mask_samples):
+            frame_mask[t] = np.mean(speech_mask_samples[start:end]) > 0.5
+
+    non_mask = ~frame_mask
+    if non_mask.sum() < 5 or frame_mask.sum() < 10:
+        return 0.0
+
+    # Noise PSD estimate from non-speech frames
+    N_f = np.median(S[:, non_mask], axis=1)  # [F]
+    N_f = np.maximum(N_f, _EPS)
+
+    S_speech   = S[:, frame_mask]                                   # [F, N_speech]
+    speech_est = np.maximum(S_speech - N_f[:, None], 0.0)
+    resid_est  = np.minimum(S_speech, N_f[:, None])
+
+    E_speech = float(speech_est.sum())
+    E_resid  = float(resid_est.sum())
+    return min(E_resid / (E_speech + _EPS), 1e6)
+
+
+def compute_posthoc_gate_score(
+    gates: list,
+    y_np: np.ndarray,
+    x_hat_np: np.ndarray,
+    gate_combine: str = "max",
+    sr: int = None,
+) -> float:
+    """Post-hoc gate score on the final waveform.  Convention: lower = worse.
+
+    gates       : list of gate names (same as --gates in enhancement.py)
+    y_np        : noisy input waveform, 1-D numpy float array (normalized)
+    x_hat_np    : enhanced waveform, same scale as y_np (normalized)
+    gate_combine: "max" or "mean" — how to combine multiple gates
+    sr          : sample rate of x_hat_np in Hz (required for "nisqa")
+
+    Gate directions:
+        leakage          lower = better (less noise leaked through)
+        wiener_residual  lower = better (less residual noise)
+        stft_leakage     lower = better (less power in silence frames)
+        nisqa            higher = better → negated so convention stays lower = worse
+    """
+    scores = {}
+    for gate in gates:
+        if gate == "leakage":
+            mask = _speech_mask(y_np)
+            scores["leakage"] = compute_speech_gate_score(y_np, x_hat_np, mask)
+        elif gate == "wiener_residual":
+            scores["wiener_residual"] = _wiener_residual_score(y_np, x_hat_np)
+        elif gate == "stft_leakage":
+            scores["stft_leakage"] = _stft_leakage_score(y_np, x_hat_np)
+        elif gate == "nisqa":
+            if sr is None:
+                raise ValueError("sr is required for the 'nisqa' gate")
+            from .nisqa_helper import compute_nisqa
+            raw = compute_nisqa(x_hat_np, sr)
+            # Negate: nisqa is higher = better; convention here is lower = worse
+            scores["nisqa"] = -float(raw) if raw is not None else 0.0
+    return combine_gate_scores(scores, gate_combine)
