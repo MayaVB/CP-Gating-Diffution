@@ -7,6 +7,35 @@ Install: pip install speechmos
 """
 import numpy as np
 
+
+def to_16k(audio: np.ndarray, sr: int) -> np.ndarray:
+    """Resample *audio* to 16 kHz, collapse to mono, return float32.
+
+    This is the ONE shared preprocessing function used everywhere DNSMOS is
+    computed (oracle_best_of_k_dnsmos_eval.py, calc_metrics.py, …).
+    Using different resamplers for selection vs. evaluation would mean the
+    selected file maximises score under one resampler while the reported
+    metric uses another — the rankings can disagree and selection appears
+    broken.
+
+    Algorithm preference: scipy.signal.resample_poly (polyphase, integer
+    ratio, low aliasing) → librosa fallback (Kaiser-window Fourier).
+    """
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim == 2:           # [T, channels] soundfile layout → mono
+        audio = audio.mean(axis=1)
+    if sr == 16000:
+        return audio
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly
+        g = gcd(16000, sr)
+        return resample_poly(audio, 16000 // g, sr // g).astype(np.float32)
+    except ImportError:
+        import librosa
+        return librosa.resample(audio, orig_sr=sr, target_sr=16000)
+
+
 _CHECKED = False
 _AVAILABLE = False
 
