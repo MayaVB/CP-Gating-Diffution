@@ -57,6 +57,10 @@ if __name__ == '__main__':
                         help='Compute DNSMOS overall MOS per file (requires speechmos package)')
     parser.add_argument("--dnsmos", action="store_true", default=False,
                         help='Alias for --compute_dnsmos')
+    parser.add_argument("--compute_nisqa", action="store_true", default=False,
+                        help='Compute NISQA overall MOS per file (requires nisqa package + checkpoint)')
+    parser.add_argument("--nisqa", action="store_true", default=False,
+                        help='Alias for --compute_nisqa')
     args = parser.parse_args()
 
     # Resolve DNSMOS callable once (None if unavailable or flag not set)
@@ -72,6 +76,21 @@ if __name__ == '__main__':
         except ImportError:
             print("WARNING: Could not import utils.dnsmos_helper; "
                   "dnsmos_ovrl will be NaN for all files.")
+
+    # Resolve NISQA callable once (None if unavailable or flag not set)
+    _nisqa_fn = None
+    if args.compute_nisqa or args.nisqa:
+        try:
+            from utils.nisqa_helper import compute_nisqa as _compute_nisqa, is_available as _nisqa_avail
+            if _nisqa_avail():
+                _nisqa_fn = _compute_nisqa
+            else:
+                print("WARNING: --compute_nisqa set but nisqa package is not installed; "
+                      "nisqa_ovrl will be NaN for all files.")
+        except ImportError:
+            print("WARNING: Could not import utils.nisqa_helper; "
+                  "nisqa_ovrl will be NaN for all files.")
+    use_nisqa = (args.compute_nisqa or args.nisqa) and (_nisqa_fn is not None)
 
     records = []  # list[dict]; add new metric keys here (e.g. "pesq", "dnsmos") when ready
 
@@ -103,7 +122,12 @@ if __name__ == '__main__':
             dnsmos_ovrl = float(_raw) if _raw is not None else float("nan")
         else:
             dnsmos_ovrl = float("nan")
-        records.append({
+        if use_nisqa:
+            _raw_n = _nisqa_fn(x_hat, sr_x_hat)
+            nisqa_ovrl = float(_raw_n) if _raw_n is not None else float("nan")
+        else:
+            nisqa_ovrl = float("nan")
+        rec = {
             "filename":    filename,
             "sisdr_enh":   sisdr_enh_val,
             "sisdr_noisy": sisdr_noisy_val,
@@ -113,7 +137,10 @@ if __name__ == '__main__':
             "si_sir":      si_sir_enh,
             "si_sar":      si_sar_enh,
             "dnsmos_ovrl": dnsmos_ovrl,
-        })
+        }
+        if use_nisqa:
+            rec["nisqa_ovrl"] = nisqa_ovrl
+        records.append(rec)
 
     # Save results as DataFrame
     df = pd.DataFrame(records)
@@ -126,6 +153,11 @@ if __name__ == '__main__':
         dns_mean = float(valid_dns.mean()) if len(valid_dns) > 0 else float("nan")
         dns_std  = float(valid_dns.std())  if len(valid_dns) > 0 else float("nan")
         print(f"DNSMOS: {dns_mean:.3f} ± {dns_std:.3f}")
+    if use_nisqa:
+        valid_nisqa = df["nisqa_ovrl"].dropna()
+        nisqa_mean = float(valid_nisqa.mean()) if len(valid_nisqa) > 0 else float("nan")
+        nisqa_std  = float(valid_nisqa.std())  if len(valid_nisqa) > 0 else float("nan")
+        print(f"NISQA:  {nisqa_mean:.3f} ± {nisqa_std:.3f}")
 
     # Save average results to file
     log = open(join(args.enhanced_dir, "_avg_results.txt"), "w")
@@ -136,6 +168,8 @@ if __name__ == '__main__':
     log.write("SI-SAR: {:.1f} ± {:.2f}".format(*mean_std(df["si_sar"].to_numpy())) + "\n")
     if _dnsmos_enabled:
         log.write(f"DNSMOS: {dns_mean:.3f} ± {dns_std:.3f}\n")
+    if use_nisqa:
+        log.write(f"NISQA:  {nisqa_mean:.3f} ± {nisqa_std:.3f}\n")
 
     # Save DataFrame as csv file
     df.to_csv(join(args.enhanced_dir, "_results.csv"), index=False)
@@ -183,6 +217,9 @@ if __name__ == '__main__':
     if _dnsmos_enabled:
         _dns_csv = join(args.enhanced_dir, "dnsmos_perutt.csv")
         df[["filename", "dnsmos_ovrl"]].rename(columns={"dnsmos_ovrl": "dnsmos"}).to_csv(_dns_csv, index=False)
+    if use_nisqa:
+        _nisqa_csv = join(args.enhanced_dir, "nisqa_perutt.csv")
+        df[["filename", "nisqa_ovrl"]].rename(columns={"nisqa_ovrl": "nisqa"}).to_csv(_nisqa_csv, index=False)
     with open(_json_path, "w") as _f:
         json.dump(tail_stats, _f, indent=2)
 
