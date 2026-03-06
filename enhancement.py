@@ -64,7 +64,7 @@ if __name__ == '__main__':
     parser.add_argument("--gate_log_every", type=int, default=1, help="Subsample per-step score logging: store every N-th step (default: 1 = every step)")
     parser.add_argument("--gate_plot", action="store_true", help="Save gate diagnostic plots after inference (requires --gate_compute_tau)")
     parser.add_argument("--gate_alpha", type=float, default=0.1, help="Miscoverage level for conformal calibration; tau is saved to _calib_tau.json when --gate_compute_tau is set")
-    parser.add_argument("--gates", nargs="+", default=["leakage"], help='Gate names to evaluate (default: ["leakage"]); only "leakage" is currently implemented')
+    parser.add_argument("--gates", nargs="+", default=["leakage"], help='Gate names to use (default: ["leakage"]); supported: "leakage", "wiener_residual", "stft_leakage", "nisqa" (post-hoc only)')
     parser.add_argument("--gate_combine", choices=["max", "mean"], default="max", help='How to combine scores from multiple gates (default: "max")')
     parser.add_argument("--gate_start_frac", type=float, default=0.0, help="Skip per-step gate scoring for the first gate_start_frac fraction of diffusion steps (0.0 = gate from step 0)")
     parser.add_argument("--gate_debug_file", type=str, default="", help="If non-empty, print per-step gate debug info only for this filename")
@@ -151,7 +151,8 @@ if __name__ == '__main__':
         gate_scores = []
 
     if args.gate_compute_tau or args.gate_tau_path:
-        from utils.speech_gate import compute_speech_gate_score, GateTrajectoryLog
+        from utils.speech_gate import (compute_speech_gate_score, GateTrajectoryLog,
+                                       compute_posthoc_gate_score)
         gate_log = []
         gate_traj_logs = []  # List[GateTrajectoryLog], one per example; used by gate_compute_tau
 
@@ -175,6 +176,13 @@ if __name__ == '__main__':
         if not _dnsmos_available:
             print("Warning: speechmos not found; DNSMOS columns will be blank. "
                   "Install with: pip install speechmos")
+
+    # NISQA availability (post-hoc only; graceful no-op if nisqa missing)
+    if "nisqa" in args.gates and (args.gate_compute_tau or args.gate_tau_path):
+        from utils.nisqa_helper import is_available as _nisqa_is_available
+        if not _nisqa_is_available():
+            print("Warning: nisqa not found; 'nisqa' gate will score 0.0. "
+                  "Install with: pip install nisqa and set NISQA_CKPT_PATH.")
 
     if args.debug_level > 0:
         print(f"[DEBUG_GATE_SAVE] enhanced_dir = {args.enhanced_dir}")
@@ -366,12 +374,12 @@ if __name__ == '__main__':
 
         if args.gate_compute_tau or args.gate_tau_path:
             y_np = y.squeeze().cpu().numpy()
+            _x_hat_norm = (x_hat / norm_factor).cpu().numpy()
 
-            # Energy-based VAD (same as calibration)
-            _energy = np.convolve(y_np ** 2, np.ones(400) / 400, mode='same')
-            speech_mask = _energy > np.percentile(_energy, 80)
-
-            s0 = compute_speech_gate_score(y_np, (x_hat / norm_factor).cpu().numpy(), speech_mask)
+            s0 = compute_posthoc_gate_score(
+                args.gates, y_np, _x_hat_norm,
+                gate_combine=args.gate_combine, sr=target_sr,
+            )
 
             if args.gate_compute_tau:
                 # Trajectory log: records per-step scores for conformal calibration
