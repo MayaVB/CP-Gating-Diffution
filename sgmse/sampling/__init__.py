@@ -26,7 +26,7 @@ def from_flattened_numpy(x, shape):
 def get_pc_sampler(
     predictor_name, corrector_name, sde, score_fn, y,
     denoise=True, eps=3e-2, snr=0.1, corrector_steps=1, probability_flow: bool = False,
-    intermediate=False, **kwargs
+    intermediate=False, step_callback=None, **kwargs
 ):
     """Create a Predictor-Corrector (PC) sampler.
 
@@ -63,6 +63,13 @@ def get_pc_sampler(
                 vec_t = torch.ones(y.shape[0], device=y.device) * t
                 xt, xt_mean = corrector.update_fn(xt, y, vec_t)
                 xt, xt_mean = predictor.update_fn(xt, y, vec_t, stepsize)
+                if step_callback is not None:
+                    step_callback({
+                        "step_idx": i,
+                        "t": float(t.item()),
+                        "xt": xt,
+                        "xt_mean": xt_mean,
+                    })
             x_result = xt_mean if denoise else xt
             ns = sde.N * (corrector.n_steps + 1)
             return x_result, ns
