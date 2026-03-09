@@ -44,6 +44,263 @@ def _set_rng_state(state):
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
+def _run_legacy_gate_restart_sampling(
+    build_sampler,
+    gate_tau,
+    gate_cache,
+    gate_seed,
+    gate_max_restarts,
+    gates,
+    gate_combine,
+    k_start,
+    gate_debug_file,
+    filename,
+    gate_log_count,
+    gate_compute_tau,
+    gate_log_every,
+    save_step_wavs,
+    do_save_step,
+    model,
+    T_orig,
+    norm_factor,
+    target_sr,
+    enhanced_dir,
+    dnsmos_available,
+):
+    """Legacy CP / per-step gate + restart path.
+
+    Runs the diffusion sampler with a per-step running-max gate that aborts and
+    restarts when the gate score exceeds tau.  At most gate_max_restarts + 1
+    attempts are made; the final attempt is always forced to completion.
+
+    Returns
+    -------
+    sample              : accepted diffusion sample tensor
+    accepted_g_steps    : per-step gate scores for the accepted attempt
+    num_restarts        : number of attempts that were aborted before acceptance
+    try0_running_max    : running_max from attempt 0 (set even if attempt 0 aborted)
+    try0_rng_state      : RNG snapshot taken just before attempt 0 (for DNSMOS replay)
+    first_reject_step   : diffusion step index of the first SamplingAborted (or None)
+    final_running_max   : running_max of the accepted attempt
+    """
+    from utils.speech_gate import (SamplingAborted,
+                                   compute_gate_scores_per_step, combine_gate_scores)
+
+    _num_restarts      = 0
+    _try0_running_max  = None        # running_max of attempt 0 (for delta_G)
+    _try0_rng_state    = None        # exact RNG snapshot before attempt 0
+    _first_reject_step = None
+    _final_running_max = -float("inf")
+    _accepted_g_steps  = []
+
+    for _attempt in range(gate_max_restarts + 1):
+        _is_last        = (_attempt == gate_max_restarts)
+        _running_max    = [-float("inf")]  # list for mutation inside closure
+        _attempt_g_steps = []              # per-step buffer; discarded on abort
+
+        def _step_cb(_si, _rm=_running_max, _tau=gate_tau, _il=_is_last,
+                     _cache=gate_cache, _buf=_attempt_g_steps):
+            if _si["step_idx"] < k_start:   # late-start: skip early steps
+                return
+            g_k = combine_gate_scores(
+                compute_gate_scores_per_step(_si, _cache, gates),
+                gate_combine,
+            )
+            if gate_debug_file and filename == gate_debug_file:
+                print(f"[gate_debug] attempt={_attempt} step={_si['step_idx']:3d} "
+                      f"g_k={g_k:.4f} rm={_rm[0]:.4f} tau={_tau:.4f}")
+            _rm[0] = max(_rm[0], g_k)
+            if gate_compute_tau and _si["step_idx"] % gate_log_every == 0:
+                _buf.append(g_k)
+            # Per-step WAV saving for test mode (first 2 utterances, target steps)
+            if save_step_wavs and gate_log_count < 2 and _si["step_idx"] in (0, 7, 15, 22, 29):
+                k = _si["step_idx"]
+                _wav_k = (model.to_audio(_si["xt_mean"].squeeze(), T_orig) * norm_factor).cpu().numpy()
+                _stem = os.path.splitext(os.path.basename(filename))[0]
+                _step_dir = join(enhanced_dir, f"test_step_{k:03d}")
+                makedirs(_step_dir, exist_ok=True)
+                _wav_path = join(_step_dir, f"{_stem}_step{k:03d}_g{g_k:.4f}.wav")
+                write(_wav_path, _wav_k, target_sr)
+                print(f"[SAVE_STEP_WAV_TEST] idx={gate_log_count} step={k} "
+                      f"g={g_k:.4f} path={_wav_path}")
+            do_save_step(_si)
+            if not _il and _rm[0] > _tau:
+                raise SamplingAborted(_si["step_idx"], _rm[0])
+
+        _set_seeds(gate_seed + _attempt)
+        if _attempt == 0 and dnsmos_available:
+            _try0_rng_state = _get_rng_state()  # snapshot exact state for try0 replay
+        try:
+            sample, _ = build_sampler(step_callback=_step_cb)()
+        except SamplingAborted as _exc:
+            _num_restarts += 1
+            if _first_reject_step is None:
+                _first_reject_step = _exc.step_idx
+            if _attempt == 0:
+                _try0_running_max = _exc.running_max
+            continue
+        if _attempt == 0:
+            _try0_running_max = _running_max[0]  # attempt 0 completed cleanly
+        _accepted_g_steps  = _attempt_g_steps    # commit accepted attempt's buffer
+        _final_running_max = _running_max[0]
+        break
+
+    return (sample, _accepted_g_steps, _num_restarts, _try0_running_max,
+            _try0_rng_state, _first_reject_step, _final_running_max)
+
+
+def _run_calibration_sampling(
+    build_sampler,
+    gate_cache,
+    gates,
+    gate_combine,
+    k_start,
+    gate_log_every,
+    do_save_step,
+    debug_level,
+    gate_traj_log_count,
+    enhanced_dir,
+    filename,
+    model,
+    T_orig,
+    norm_factor,
+    target_sr,
+):
+    """Calibration-only / plain sampling path (no gate decisions).
+
+    Collects per-step gate scores for conformal tau calibration without ever
+    aborting or restarting.  Used when --gate_compute_tau is set but
+    --gate_tau_path is not.
+
+    Returns
+    -------
+    sample           : diffusion sample tensor (single pass, no rejection)
+    accepted_g_steps : per-step gate scores collected during this pass
+    """
+    from utils.speech_gate import compute_gate_scores_per_step, combine_gate_scores
+
+    _attempt_g_steps = []
+
+    def _step_cb_cal(_si, _cache=gate_cache, _buf=_attempt_g_steps):
+        if _si["step_idx"] < k_start:   # late-start: skip early steps
+            return
+        if _si["step_idx"] % gate_log_every == 0:
+            g_k = combine_gate_scores(
+                compute_gate_scores_per_step(_si, _cache, gates),
+                gate_combine,
+            )
+            _buf.append(g_k)
+            do_save_step(_si)
+            # Per-step WAV saving and debug prints (debug_level > 0 only)
+            if debug_level > 0 and _si["step_idx"] in (0, 7, 15, 22, 29):
+                _intended = join(enhanced_dir, f"step_{_si['step_idx']:03d}", filename)
+                print(f"[DEBUG_GATE_SAVE] step={_si['step_idx']:3d}  g_k={g_k:.6f}  "
+                      f"intended_path={_intended}")
+                # Save WAV for first 2 utterances only
+                if gate_traj_log_count < 2:
+                    k = _si["step_idx"]
+                    _wav_k = model.to_audio(_si["xt_mean"].squeeze(), T_orig)
+                    _wav_k = (_wav_k * norm_factor).cpu().numpy()
+                    # Sanity check
+                    _peak   = float(np.max(np.abs(_wav_k)))
+                    _rms    = float(np.sqrt(np.mean(_wav_k ** 2)))
+                    _n      = len(_wav_k)
+                    _finite = bool(np.isfinite(_wav_k).all())
+                    print(f"[STEP_WAV_STATS] idx={gate_traj_log_count} step={k} "
+                          f"n={_n} peak={_peak:.4f} rms={_rms:.4f} finite={_finite}")
+                    if not _finite or _peak == 0 or _rms < 1e-6:
+                        print(f"[STEP_WAV_STATS] WARNING: idx={gate_traj_log_count} "
+                              f"step={k} — audio is {'non-finite' if not _finite else 'silent/zero'}")
+                    _stem     = os.path.splitext(os.path.basename(filename))[0]
+                    _step_dir = join(enhanced_dir, f"step_{k:03d}")
+                    makedirs(_step_dir, exist_ok=True)
+                    _wav_path = join(_step_dir, f"{_stem}_step{k:03d}_g{g_k:.4f}.wav")
+                    write(_wav_path, _wav_k, target_sr)
+                    print(f"[SAVE_STEP_WAV] idx={gate_traj_log_count} step={k} "
+                          f"g={g_k:.4f} path={_wav_path}")
+
+    sample, _ = build_sampler(step_callback=_step_cb_cal)()
+    return sample, _attempt_g_steps
+
+
+def _run_adaptive_k_sampling(
+    build_sampler,
+    adaptive_tau,
+    adaptive_kmax,
+    base_seed,
+    model,
+    T_orig,
+    norm_factor,
+    y_np,
+):
+    """Adaptive-K inference policy: binary escalation based on baseline difficulty.
+
+    Score metric: wiener_residual (reference-free, lower = better).
+
+    Algorithm
+    ---------
+    1. Generate baseline sample x0 (try 0).
+    2. Compute d0 = wiener_residual(x0).
+    3. If d0 <= adaptive_tau: return x0 (no escalation, K=1).
+    4. Else: generate tries 1..adaptive_kmax-1, score each,
+             return the try with the lowest score (including try 0).
+
+    Parameters
+    ----------
+    build_sampler   : callable() → sampler (as built per-utterance in main loop)
+    adaptive_tau    : float — difficulty threshold; d0 > tau triggers escalation
+    adaptive_kmax   : int   — max total number of tries when escalating
+    base_seed       : int or None — per-utterance RNG base; try j uses base_seed+j.
+                      If None, seeding is skipped (stochastic / non-reproducible).
+                      Caller computes: gate_seed + 1000 * utterance_idx.
+                      This is independent of the legacy restart/try0_rng_state logic.
+    model           : ScoreModel instance
+    T_orig          : int   — original waveform length (for model.to_audio)
+    norm_factor     : float — amplitude normalisation factor used pre-inference
+    y_np            : np.ndarray [T] — normalised noisy input (for score computation)
+
+    Returns
+    -------
+    x_hat        : best enhanced waveform tensor [T], scaled by norm_factor
+    chosen_k     : 1 if not escalated, adaptive_kmax if escalated
+    chosen_try   : index (0-based) of the selected try
+    d0           : baseline difficulty score (wiener_residual of try 0)
+    best_score   : wiener_residual score of the selected try
+    escalated    : True if extra tries were generated
+    """
+    from utils.speech_gate import _wiener_residual_score
+
+    def _score(x_hat_tensor):
+        """Wiener residual score for adaptive-K waveform selection (lower = better)."""
+        return _wiener_residual_score(y_np, (x_hat_tensor / norm_factor).cpu().numpy())
+
+    # --- Try 0: baseline ---
+    if base_seed is not None:
+        _set_seeds(base_seed + 0)
+    sample_0, _ = build_sampler()()
+    x_hat_0 = model.to_audio(sample_0.squeeze(), T_orig) * norm_factor
+    d0 = _score(x_hat_0)
+
+    if d0 <= adaptive_tau:
+        # Baseline is good enough — no escalation
+        return x_hat_0, 1, 0, d0, d0, False
+
+    # --- Escalate: tries 1..adaptive_kmax-1 ---
+    scores = [d0]
+    x_hats = [x_hat_0]
+    for k in range(1, adaptive_kmax):
+        if base_seed is not None:
+            _set_seeds(base_seed + k)
+        s_k, _ = build_sampler()()
+        x_k = model.to_audio(s_k.squeeze(), T_orig) * norm_factor
+        scores.append(_score(x_k))
+        x_hats.append(x_k)
+
+    chosen_try = int(np.argmin(scores))
+    best_score = float(scores[chosen_try])
+    return x_hats[chosen_try], adaptive_kmax, chosen_try, d0, best_score, True
+
+
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--test_dir", type=str, required=True, help='Directory containing the test data')
@@ -75,7 +332,47 @@ if __name__ == '__main__':
     parser.add_argument("--save_steps_all", action="store_true", help="Save step snapshots for all utterances (requires OUVESDE + PC sampler)")
     parser.add_argument("--save_steps_dir_prefix", type=str, default="step", help="Directory prefix for step snapshots; outputs to {enhanced_dir}/{prefix}_{k:03d}/")
     parser.add_argument("--save_steps_limit", type=int, default=0, help="If >0, save step snapshots only for first N utterances (0 = no limit; use with --save_steps_all)")
+    # --- Adaptive-K policy args ---
+    parser.add_argument("--policy", choices=["legacy", "adaptive_k"], default="legacy",
+                        help="Inference policy: 'legacy' = existing per-step gate/restart (default); "
+                             "'adaptive_k' = reference-free difficulty-based K escalation")
+    parser.add_argument("--adaptive_score", choices=["wiener_residual"], default="wiener_residual",
+                        help="Post-hoc score used for adaptive-K difficulty and selection (default: wiener_residual)")
+    parser.add_argument("--adaptive_tau", type=float, default=None,
+                        help="Difficulty threshold for adaptive_k policy: if d0 > tau, escalate to K_max tries. "
+                             "Required when --policy adaptive_k.")
+    parser.add_argument("--adaptive_kmax", type=int, default=10,
+                        help="Max number of tries for adaptive_k escalation (default: 10)")
     args = parser.parse_args()
+
+    if args.policy == "adaptive_k" and args.adaptive_tau is None:
+        raise ValueError("--adaptive_tau is required when --policy adaptive_k")
+
+    # --- Adaptive-K: warn once about legacy-only args that are active but will be ignored ---
+    if args.policy == "adaptive_k":
+        _legacy_active = []
+        if args.gate_tau_path is not None:
+            _legacy_active.append("gate_tau_path")
+        if args.gate_compute_tau:
+            _legacy_active.append("gate_compute_tau")
+        if args.gate_calibration:
+            _legacy_active.append("gate_calibration")
+        if args.gates != ["leakage"]:
+            _legacy_active.append("gates")
+        if args.gate_combine != "max":
+            _legacy_active.append("gate_combine")
+        if args.gate_max_restarts != 10:
+            _legacy_active.append("gate_max_restarts")
+        if args.save_steps_all:
+            _legacy_active.append("save_steps_all")
+        if args.save_steps_limit > 0:
+            _legacy_active.append("save_steps_limit")
+        if args.gate_plot:
+            _legacy_active.append("gate_plot")
+        if args.gate_debug_file:
+            _legacy_active.append("gate_debug_file")
+        if _legacy_active:
+            print(f"[adaptive_k] Ignoring legacy gating args: {', '.join(_legacy_active)}")
 
     # Research output directories (rooted under enhanced_dir)
     _rd_calib = join(args.enhanced_dir, "calib")
@@ -190,8 +487,11 @@ if __name__ == '__main__':
         print(f"[DEBUG_GATE_SAVE] gate_compute_tau = {args.gate_compute_tau}")
         print(f"[DEBUG_GATE_SAVE] WAV save condition (not gate_compute_tau) = {not args.gate_compute_tau}")
 
+    # Per-utterance log for adaptive_k mode (None in legacy mode so accidental use raises early)
+    _ak_log = [] if args.policy == "adaptive_k" else None
+
     # Enhance files
-    for noisy_file in tqdm(noisy_files):
+    for _utt_idx, noisy_file in enumerate(tqdm(noisy_files)):
         filename = noisy_file.replace(args.test_dir, "")
         filename = filename[1:] if filename.startswith("/") else filename
 
@@ -230,9 +530,6 @@ if __name__ == '__main__':
             else:
                 raise ValueError(f"SDE {model.sde.__class__.__name__} not supported")
 
-        # Per-step score buffer: populated when gate_compute_tau is active.
-        _accepted_g_steps = []
-
         # Generic step-snapshot callback (independent of gating)
         def _do_save_step(_si):
             if not _save_steps_enabled:
@@ -250,6 +547,57 @@ if __name__ == '__main__':
             _wav_path = join(_step_dir, f"{_stem}_step{_k:03d}.wav")
             write(_wav_path, _wav_k, target_sr)
 
+        # -----------------------------------------------------------------------
+        # Dispatch: three mutually exclusive inference paths
+        #   1. adaptive_k  — reference-free difficulty-based K escalation (this block)
+        #   2. legacy CP   — per-step gate + restart (gate_tau_path / gate_compute_tau)
+        #   3. plain       — single-pass diffusion, no gating
+        # Legacy gating args (gate_tau_path, gate_compute_tau, gates, gate_combine, …)
+        # are intentionally ignored in adaptive_k mode; a startup warning lists them.
+        # -----------------------------------------------------------------------
+        if args.policy == "adaptive_k":
+            y_np = y.squeeze().cpu().numpy()
+            # Per-utterance base seed: deterministic from gate_seed + utterance index.
+            # Each try j within this utterance uses base_seed + j, keeping tries independent.
+            # If gate_seed is None, stochastic (non-reproducible) mode is used.
+            _ak_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
+            (x_hat,
+             _ak_chosen_k,
+             _ak_chosen_try,
+             _ak_d0,
+             _ak_best_score,
+             _ak_escalated) = _run_adaptive_k_sampling(
+                build_sampler=_build_sampler,
+                adaptive_tau=args.adaptive_tau,
+                adaptive_kmax=args.adaptive_kmax,
+                base_seed=_ak_base_seed,
+                model=model,
+                T_orig=T_orig,
+                norm_factor=norm_factor,
+                y_np=y_np,
+            )
+            print(f"[adaptive_k] file={filename}  utt_idx={_utt_idx}  "
+                  f"base_seed={_ak_base_seed}  d0={_ak_d0:.4f}  "
+                  f"escalated={_ak_escalated}  chosen_k={_ak_chosen_k}  "
+                  f"chosen_try={_ak_chosen_try}  best_score={_ak_best_score:.4f}")
+            _ak_log.append({
+                "utterance_idx":  _utt_idx,
+                "filename":       filename,
+                "base_seed_used": _ak_base_seed,
+                "adaptive_score": args.adaptive_score,
+                "adaptive_tau":   args.adaptive_tau,
+                "adaptive_kmax":  args.adaptive_kmax,
+                "d0":             round(float(_ak_d0), 6),
+                "escalated":      int(_ak_escalated),
+                "chosen_k":       _ak_chosen_k,
+                "chosen_try":     _ak_chosen_try,
+                "best_score":     round(float(_ak_best_score), 6),
+            })
+            makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
+            write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
+            _save_steps_utt_idx[0] += 1
+            continue
+
         # Build per-step cache once per utterance whenever per-step scoring is needed.
         if args.gate_tau_path or args.gate_compute_tau:
             _yf_power = (Y[0].abs() ** 2).sum(dim=(0, 1)).detach().cpu().numpy()
@@ -258,111 +606,65 @@ if __name__ == '__main__':
                 "eps": 1e-8,
             }
 
-        # Reverse sampling
+        # --- Path 2 / Path 3: legacy CP gate or plain sampling ---
         if args.gate_tau_path:
-            # Per-step running-max rejection with restarts
-            _num_restarts = 0
-            _try0_running_max = None        # running_max of attempt 0 (for delta_G)
-            _try0_rng_state   = None        # exact RNG snapshot before attempt 0
-            _first_reject_step = None
-            _final_running_max = -float("inf")
-            for _attempt in range(args.gate_max_restarts + 1):
-                _is_last = (_attempt == args.gate_max_restarts)
-                _running_max = [-float("inf")]  # list for mutation inside closure
-                _attempt_g_steps = []           # per-step buffer; discarded on abort
-                def _step_cb(_si, _rm=_running_max, _tau=_gate_tau_loaded, _il=_is_last,
-                             _cache=_gate_cache, _buf=_attempt_g_steps):
-                    if _si["step_idx"] < _k_start:   # late-start: skip early steps
-                        return
-                    g_k = combine_gate_scores(
-                        compute_gate_scores_per_step(_si, _cache, args.gates),
-                        args.gate_combine,
-                    )
-                    if args.gate_debug_file and filename == args.gate_debug_file:
-                        print(f"[gate_debug] attempt={_attempt} step={_si['step_idx']:3d} "
-                              f"g_k={g_k:.4f} rm={_rm[0]:.4f} tau={_tau:.4f}")
-                    _rm[0] = max(_rm[0], g_k)
-                    if args.gate_compute_tau and _si["step_idx"] % args.gate_log_every == 0:
-                        _buf.append(g_k)
-                    # Per-step WAV saving for test mode (first 2 utterances, target steps)
-                    if args.save_step_wavs and len(gate_log) < 2 and _si["step_idx"] in (0, 7, 15, 22, 29):
-                        k = _si["step_idx"]
-                        _wav_k = (model.to_audio(_si["xt_mean"].squeeze(), T_orig) * norm_factor).cpu().numpy()
-                        _stem = os.path.splitext(os.path.basename(filename))[0]
-                        _step_dir = join(args.enhanced_dir, f"test_step_{k:03d}")
-                        makedirs(_step_dir, exist_ok=True)
-                        _wav_path = join(_step_dir, f"{_stem}_step{k:03d}_g{g_k:.4f}.wav")
-                        write(_wav_path, _wav_k, target_sr)
-                        print(f"[SAVE_STEP_WAV_TEST] idx={len(gate_log)} step={k} "
-                              f"g={g_k:.4f} path={_wav_path}")
-                    _do_save_step(_si)
-                    if not _il and _rm[0] > _tau:
-                        raise SamplingAborted(_si["step_idx"], _rm[0])
-                _set_seeds(args.gate_seed + _attempt)
-                if _attempt == 0 and _dnsmos_available:
-                    _try0_rng_state = _get_rng_state()  # snapshot exact state for try0 replay
-                try:
-                    sample, _ = _build_sampler(step_callback=_step_cb)()
-                except SamplingAborted as _exc:
-                    _num_restarts += 1
-                    if _first_reject_step is None:
-                        _first_reject_step = _exc.step_idx
-                    if _attempt == 0:
-                        _try0_running_max = _exc.running_max
-                    continue
-                if _attempt == 0:
-                    _try0_running_max = _running_max[0]  # attempt 0 completed cleanly
-                _accepted_g_steps = _attempt_g_steps     # commit accepted attempt's buffer
-                _final_running_max = _running_max[0]
-                break
+            # Path 2a: legacy CP — per-step running-max rejection + restart
+            (sample,
+             _accepted_g_steps,
+             _num_restarts,
+             _try0_running_max,
+             _try0_rng_state,
+             _first_reject_step,
+             _final_running_max) = _run_legacy_gate_restart_sampling(
+                build_sampler=_build_sampler,
+                gate_tau=_gate_tau_loaded,
+                gate_cache=_gate_cache,
+                gate_seed=args.gate_seed,
+                gate_max_restarts=args.gate_max_restarts,
+                gates=args.gates,
+                gate_combine=args.gate_combine,
+                k_start=_k_start,
+                gate_debug_file=args.gate_debug_file,
+                filename=filename,
+                gate_log_count=len(gate_log),
+                gate_compute_tau=args.gate_compute_tau,
+                gate_log_every=args.gate_log_every,
+                save_step_wavs=args.save_step_wavs,
+                do_save_step=_do_save_step,
+                model=model,
+                T_orig=T_orig,
+                norm_factor=norm_factor,
+                target_sr=target_sr,
+                enhanced_dir=args.enhanced_dir,
+                dnsmos_available=_dnsmos_available,
+            )
         else:
             if args.gate_compute_tau:
-                # Calibration-only pass: collect per-step scores, no gate decisions.
-                _attempt_g_steps = []
-                def _step_cb_cal(_si, _cache=_gate_cache, _buf=_attempt_g_steps):
-                    if _si["step_idx"] < _k_start:   # late-start: skip early steps
-                        return
-                    if _si["step_idx"] % args.gate_log_every == 0:
-                        g_k = combine_gate_scores(
-                            compute_gate_scores_per_step(_si, _cache, args.gates),
-                            args.gate_combine,
-                        )
-                        _buf.append(g_k)
-                        _do_save_step(_si)
-                        # Per-step WAV saving and debug prints (debug_level > 0 only)
-                        if args.debug_level > 0 and _si["step_idx"] in (0, 7, 15, 22, 29):
-                            _intended = join(args.enhanced_dir, f"step_{_si['step_idx']:03d}", filename)
-                            print(f"[DEBUG_GATE_SAVE] step={_si['step_idx']:3d}  g_k={g_k:.6f}  "
-                                  f"intended_path={_intended}")
-                            # Save WAV for first 2 utterances only
-                            if len(gate_traj_logs) < 2:
-                                k = _si["step_idx"]
-                                _wav_k = model.to_audio(_si["xt_mean"].squeeze(), T_orig)
-                                _wav_k = (_wav_k * norm_factor).cpu().numpy()
-                                # Sanity check
-                                _peak = float(np.max(np.abs(_wav_k)))
-                                _rms  = float(np.sqrt(np.mean(_wav_k ** 2)))
-                                _n    = len(_wav_k)
-                                _finite = bool(np.isfinite(_wav_k).all())
-                                print(f"[STEP_WAV_STATS] idx={len(gate_traj_logs)} step={k} "
-                                      f"n={_n} peak={_peak:.4f} rms={_rms:.4f} finite={_finite}")
-                                if not _finite or _peak == 0 or _rms < 1e-6:
-                                    print(f"[STEP_WAV_STATS] WARNING: idx={len(gate_traj_logs)} "
-                                          f"step={k} — audio is {'non-finite' if not _finite else 'silent/zero'}")
-                                _stem = os.path.splitext(os.path.basename(filename))[0]
-                                _step_dir = join(args.enhanced_dir, f"step_{k:03d}")
-                                makedirs(_step_dir, exist_ok=True)
-                                _wav_path = join(_step_dir, f"{_stem}_step{k:03d}_g{g_k:.4f}.wav")
-                                write(_wav_path, _wav_k, target_sr)
-                                print(f"[SAVE_STEP_WAV] idx={len(gate_traj_logs)} step={k} "
-                                      f"g={g_k:.4f} path={_wav_path}")
-                sample, _ = _build_sampler(step_callback=_step_cb_cal)()
-                _accepted_g_steps = _attempt_g_steps
+                # Path 2b: legacy calibration-only — collect per-step scores, no gate decisions.
+                sample, _accepted_g_steps = _run_calibration_sampling(
+                    build_sampler=_build_sampler,
+                    gate_cache=_gate_cache,
+                    gates=args.gates,
+                    gate_combine=args.gate_combine,
+                    k_start=_k_start,
+                    gate_log_every=args.gate_log_every,
+                    do_save_step=_do_save_step,
+                    debug_level=args.debug_level,
+                    gate_traj_log_count=len(gate_traj_logs),
+                    enhanced_dir=args.enhanced_dir,
+                    filename=filename,
+                    model=model,
+                    T_orig=T_orig,
+                    norm_factor=norm_factor,
+                    target_sr=target_sr,
+                )
             else:
+                # Path 3: plain single-pass sampling (no gating)
                 _cb = _do_save_step if _save_steps_enabled else None
                 sample, _ = _build_sampler(step_callback=_cb)()
-            _num_restarts = 0
-            _try0_running_max = None
+                _accepted_g_steps = []
+            _num_restarts      = 0
+            _try0_running_max  = None
             _first_reject_step = None
             _final_running_max = None
         
@@ -567,3 +869,26 @@ if __name__ == '__main__':
         print(f"p95:   {percentiles[3]:.4f}")
         print(f"p99:   {percentiles[4]:.4f}")
         print("Scores saved to speech_gate_scores.npy")
+
+    if args.policy == "adaptive_k" and _ak_log:
+        _ak_csv_path = join(args.enhanced_dir, "adaptive_k_log.csv")
+        _ak_fields = ["utterance_idx", "filename", "base_seed_used",
+                      "adaptive_score", "adaptive_tau", "adaptive_kmax",
+                      "d0", "escalated", "chosen_k", "chosen_try", "best_score"]
+        with open(_ak_csv_path, "w", newline="") as _f:
+            _writer = csv.DictWriter(_f, fieldnames=_ak_fields)
+            _writer.writeheader()
+            _writer.writerows(_ak_log)
+        print(f"\nAdaptive-K log saved to {_ak_csv_path}")
+        _n_files     = len(_ak_log)
+        _n_escalated = sum(r["escalated"] for r in _ak_log)
+        _esc_rate    = _n_escalated / _n_files if _n_files else 0.0
+        _mean_k      = sum(r["chosen_k"]    for r in _ak_log) / _n_files if _n_files else 0.0
+        _mean_d0     = sum(r["d0"]          for r in _ak_log) / _n_files if _n_files else 0.0
+        _mean_best   = sum(r["best_score"]  for r in _ak_log) / _n_files if _n_files else 0.0
+        print("\n--- Adaptive-K Run Summary ---")
+        print(f"n_files         = {_n_files}")
+        print(f"n_escalated     = {_n_escalated}  ({_esc_rate:.1%})")
+        print(f"mean_chosen_k   = {_mean_k:.2f}")
+        print(f"mean_d0         = {_mean_d0:.4f}")
+        print(f"mean_best_score = {_mean_best:.4f}")
