@@ -540,7 +540,7 @@ if __name__ == '__main__':
             if not args.save_steps_all:
                 if args.save_steps_limit > 0 and _save_steps_utt_idx[0] >= args.save_steps_limit:
                     return
-            _stem = os.path.splitext(os.path.basename(filename))[0]
+            _stem = os.path.splitext(os._step_cbpath.basename(filename))[0]
             _wav_k = (model.to_audio(_si["xt_mean"].squeeze(), T_orig) * norm_factor).cpu().numpy()
             _step_dir = join(args.enhanced_dir, f"{args.save_steps_dir_prefix}_{_k:03d}")
             makedirs(_step_dir, exist_ok=True)
