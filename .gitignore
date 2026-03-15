@@ -6,6 +6,8 @@ checkpoints_updated/
 .yaml
 .npy
 voicebank/
+nisqa_weights/
+wsj0_chime3/
 
 ### Emacs ###
 # -*- mode: gitignore; -*-

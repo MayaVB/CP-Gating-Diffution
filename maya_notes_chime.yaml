@@ -1,0 +1,59 @@
+# ===== WSJ0-CHiME3 Baseline run =======
+# dataset: /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3
+# checkpoint: checkpoints_updated/train_wsj0_2cta4cov_epoch=159.ckpt (ncsnpp/ouve, 16kHz)
+
+# run baseline enhancement:
+cd /home/dsi/mayavb/PythonProjects/sgmse
+python enhancement_orig.py \
+  --test_dir /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/noisy \
+  --enhanced_dir wsj0_chime3/test_enhanced_baseline \
+  --ckpt checkpoints_updated/train_wsj0_2cta4cov_epoch=159.ckpt
+
+# baseline metrics
+python calc_metrics.py \
+  --clean_dir /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/clean \
+  --noisy_dir /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/noisy \
+  --enhanced_dir wsj0_chime3/test_enhanced_baseline \
+  --dnsmos
+
+
+# ===== WSJ0-CHiME3 Oracle run (SI-SDR) =======
+# NOTE: 2267 test files — q_percent=50 + K=5 => ~5600 runs; start small
+# Prereq: wsj0_chime3/test_enhanced_baseline/_results.csv must exist (done)
+cd /home/dsi/mayavb/PythonProjects/sgmse && CUDA_VISIBLE_DEVICES=1 python oracle_resample_eval.py \
+  --test_dir /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/noisy \
+  --clean_dir /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/clean \
+  --baseline_enhanced_dir wsj0_chime3/test_enhanced_baseline \
+  --work_dir wsj0_chime3/oracle_exp \
+  --q_percent 50 \
+  --K_list 1 2 5 \
+  --seed_base 100 \
+  --enhancement_cmd "CUDA_VISIBLE_DEVICES=1 python enhancement.py --test_dir /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/noisy --ckpt checkpoints_updated/train_wsj0_2cta4cov_epoch=159.ckpt" \
+  --metrics_cmd "CUDA_VISIBLE_DEVICES=1 python calc_metrics.py --clean_dir /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/clean --noisy_dir /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/noisy"
+
+
+# ===== WSJ0-CHiME3 Leakage best-of-K =======
+# Prereq: oracle_exp try folders must exist (run oracle above first)
+
+# wiener_residual selection on worst-50% SI-SDR:
+CUDA_VISIBLE_DEVICES=0 python leakage_best_of_k_eval.py \
+  --tries_root wsj0_chime3/oracle_exp \
+  --clean_dir  /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/clean \
+  --noisy_dir  /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/noisy \
+  --work_dir   wsj0_chime3/leakage_worst50sisdr_exp \
+  --dir_pattern "worst_try_*" \
+  --baseline_enhanced_dir wsj0_chime3/test_enhanced_baseline \
+  --select_by wiener_residual \
+  --dnsmos
+
+# stft_leakage selection:
+CUDA_VISIBLE_DEVICES=0 python leakage_best_of_k_eval.py \
+  --tries_root wsj0_chime3/oracle_exp \
+  --clean_dir  /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/clean \
+  --noisy_dir  /private/gannot-lab/gannot-lab1/datasets/WSJ0_chime3/test/noisy \
+  --work_dir   wsj0_chime3/leakage_worst50sisdr_exp \
+  --dir_pattern "worst_try_*" \
+  --baseline_enhanced_dir wsj0_chime3/test_enhanced_baseline \
+  --select_by stft_leakage \
+  --dnsmos
+

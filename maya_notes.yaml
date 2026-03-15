@@ -1,0 +1,358 @@
+# ===== Baseline run =======
+# run baseline enhancement:
+cd /home/dsi/mayavb/PythonProjects/sgmse
+python enhancement.py \
+  --test_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_baseline \
+  --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt
+
+# baseline metrics
+python calc_metrics.py \
+  --clean_dir voicebank/test_clean \
+  --noisy_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_baseline \
+  --dnsmos
+
+
+# ===== Calibration run =======
+# Calibration with per-step gate (alpha = 0.1)
+python enhancement.py \
+  --test_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/calib_perstep_alpha0.1 \
+  --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt \
+  --gate_compute_tau \
+  --gate_alpha 0.1 \
+  --gate_plot
+
+# Test run with per-step gate
+python enhancement.py \
+  --test_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_perstep_alpha0.1 \
+  --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt \
+  --gate_tau_path voicebank/calib_perstep_alpha0.1/calib/_calib_tau.json \
+  --gate_max_restarts 5 \
+  --gate_seed 0 \
+  --save_step_wavs
+
+# Metrics
+python calc_metrics.py \
+  --clean_dir voicebank/test_clean \
+  --noisy_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_perstep_alpha0.1
+
+
+
+# ===== Oracle run SI-SDR =======
+# oracle run on 50% worst dataset
+cd /home/dsi/mayavb/PythonProjects/sgmse && python oracle_resample_eval.py \
+  --test_dir voicebank/test_noisy \
+  --clean_dir voicebank/test_clean \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --work_dir voicebank/oracle_exp \
+  --q_percent 50 \
+  --K_list 2 5 10 \
+  --seed_base 100 \
+  --enhancement_cmd "python enhancement.py --test_dir voicebank/test_noisy --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt" \
+  --metrics_cmd "python calc_metrics.py --clean_dir voicebank/test_clean --noisy_dir voicebank/test_noisy"
+
+# oracle full run
+cd /home/dsi/mayavb/PythonProjects/sgmse && python oracle_resample_eval.py \
+  --test_dir voicebank/test_noisy \
+  --clean_dir voicebank/test_clean \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --work_dir voicebank/oracle_exp_full \
+  --K_list 2 5 \
+  --seed_base 100 \
+  --enhancement_cmd "python enhancement.py --test_dir voicebank/test_noisy --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt" \
+  --metrics_cmd "python calc_metrics.py --clean_dir voicebank/test_clean --noisy_dir voicebank/test_noisy"
+
+# oracle run with dnsmoss:   --enable_dnsmos_oracle
+
+# ===== Oracle run PESQ =======
+# Ranks worst-q% by lowest PESQ, selects best try by max PESQ, reports PESQ + SI-SDR curves.
+# Prereq: baseline _results.csv must exist (run calc_metrics.py on baseline first).
+cd /home/dsi/mayavb/PythonProjects/sgmse && python oracle_resample_eval_pesq.py \
+  --test_dir voicebank/test_noisy \
+  --clean_dir voicebank/test_clean \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --work_dir voicebank/oracle_exp_pesq \
+  --q_percent 20 \
+  --K_list 1 2 5 10 \
+  --seed_base 100 \
+  --enhancement_cmd "python enhancement.py --test_dir voicebank/test_noisy --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt" \
+  --metrics_cmd "python calc_metrics.py --clean_dir voicebank/test_clean --noisy_dir voicebank/test_noisy"
+
+
+# ===== Best-of-K DNSMOS selection oracle =======
+# First generate K tries via oracle_resample_eval (or any other method that produces try_0/ … try_{K-1}/)
+# Then run:
+CUDA_VISIBLE_DEVICES=0 python oracle_best_of_k_dnsmos_eval.py \
+  --tries_root voicebank/oracle_exp_dnsmos \
+  --clean_dir  voicebank/test_clean \
+  --noisy_dir  voicebank/test_noisy \
+  --work_dir   voicebank/best_of_k_dnsmos_exp \
+  --dir_pattern "worst_try_*"
+
+# ===== Best-of-K leakage selection oracle =======
+CUDA_VISIBLE_DEVICES=0 python leakage_best_of_k_eval.py \
+  --tries_root voicebank/oracle_exp_dnsmos \
+  --clean_dir  voicebank/test_clean \
+  --noisy_dir  voicebank/test_noisy \
+  --work_dir   voicebank/leakage_best_of_k_exp \
+  --dir_pattern "worst_try_*" \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --dnsmos
+
+
+
+
+# ===== Testing dnsmoss in early diff steps =======
+# Step-snapshot enhancement (generates step_000/, step_007/, ... for all files)
+CUDA_VISIBLE_DEVICES=0 python enhancement.py \
+  --test_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/step_snapshots \
+  --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt \
+  --N 30 --sampler_type pc \
+  --save_steps_all \
+  --save_steps "0,7,15,22,29"
+
+# DNSMOS early-step overlap eval (run after step-snapshot enhancement)
+python dnsmos_early_overlap_eval.py \
+  --enhanced_dir voicebank/step_snapshots \
+  --work_dir voicebank/dnsmos_overlap \
+  --q_percent 10
+
+# (resumable if interrupted)
+python dnsmos_early_overlap_eval.py \
+  --enhanced_dir voicebank/step_snapshots \
+  --work_dir voicebank/dnsmos_overlap \
+  --q_percent 10 \
+  --resume
+
+
+
+
+
+
+# ===== Testing gates =======
+# Step 2 — leakage selection on worst-30% SI-SDR
+CUDA_VISIBLE_DEVICES=0 
+python leakage_best_of_k_eval.py \
+  --tries_root voicebank/oracle_exp \
+  --clean_dir  voicebank/test_clean \
+  --noisy_dir  voicebank/test_noisy \
+  --work_dir   voicebank/leakage_worst10sisdr_exp \
+  --dir_pattern "worst_try_*" \
+  --file_list  voicebank/worst10_sisdr.txt \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --select_by stft_leakage \
+  --dnsmos
+
+CUDA_VISIBLE_DEVICES=0 
+python leakage_best_of_k_eval.py \
+  --tries_root voicebank/oracle_exp \
+  --clean_dir  voicebank/test_clean \
+  --noisy_dir  voicebank/test_noisy \
+  --work_dir   voicebank/leakage_worst30sisdr_exp \
+  --dir_pattern "worst_try_*" \
+  --file_list  voicebank/worst30_sisdr.txt \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --select_by stft_leakage \
+  --dnsmos
+
+CUDA_VISIBLE_DEVICES=0 
+python leakage_best_of_k_eval.py \
+  --tries_root voicebank/oracle_exp \
+  --clean_dir  voicebank/test_clean \
+  --noisy_dir  voicebank/test_noisy \
+  --work_dir   voicebank/leakage_worst10sisdr_exp \
+  --dir_pattern "worst_try_*" \
+  --file_list  voicebank/worst10_sisdr.txt \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --select_by wiener_residual \
+  --dnsmos
+
+
+CUDA_VISIBLE_DEVICES=1
+python leakage_best_of_k_eval.py \
+  --tries_root voicebank/oracle_exp \
+  --clean_dir  voicebank/test_clean \
+  --noisy_dir  voicebank/test_noisy \
+  --work_dir   voicebank/leakage_worst10sisdr_exp \
+  --dir_pattern "worst_try_*" \
+  --file_list  voicebank/worst10_sisdr.txt \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --select_by wiener_residual \
+  --dnsmos
+
+
+
+  CUDA_VISIBLE_DEVICES=0 python leakage_best_of_k_eval.py \
+  --tries_root voicebank/oracle_exp \
+  --clean_dir voicebank/test_clean \
+  --noisy_dir voicebank/test_noisy \
+  --work_dir voicebank/leakage_worst10sisdr_exp \
+  --dir_pattern "worst_try_*" \
+  --file_list voicebank/worst10_pesq.txt \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --select_by nisqa \
+  --dnsmos
+
+
+
+
+# ===== General added dnsmoss metric to metrics =======
+python calc_metrics.py \
+  --clean_dir voicebank/test_clean \
+  --noisy_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_baseline \
+  --dnsmos
+
+
+
+
+# ===== Adaptive-K threshold sweep (offline, no re-inference) =======
+# Prereq: try folders must already exist (e.g. from oracle_resample_eval or adaptive_k run)
+#         Each try folder (try_0/, try_1/, ...) must contain one enhanced .wav per test file.
+#
+# Minimal run — wiener_residual only, no DNSMOS:
+python threshold_sweep_eval.py \
+  --tries_root voicebank/oracle_exp \
+  --clean_dir  voicebank/test_clean \
+  --noisy_dir  voicebank/test_noisy \
+  --work_dir   voicebank/threshold_sweep_exp \
+  --K_high 10 \
+  --scores wiener_residual \
+  --n_tau 60
+
+# Full run — all four proxy scores + DNSMOS:
+python threshold_sweep_eval.py \
+  --tries_root voicebank/oracle_exp \
+  --clean_dir  voicebank/test_clean \
+  --noisy_dir  voicebank/test_noisy \
+  --work_dir   voicebank/threshold_sweep_exp \
+  --K_high 10 \
+  --scores leakage stft_leakage wiener_residual nisqa \
+  --n_tau 60 \
+  --compute_dnsmos
+
+
+
+################ gate pushed to 20% was with performence degradation
+
+# Calibration with per-step gate (alpha = 0.1) also gate_start_frac 0.2
+  python enhancement.py \
+  --test_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/calib_perstep_alpha0.1_start_frac0.2 \
+  --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt \
+  --gate_compute_tau \
+  --gate_alpha 0.1 \
+  --gate_start_frac 0.2 \
+  --gate_plot
+
+# Test run with per-step gate
+python enhancement.py \
+  --test_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_perstep_alpha0.1_start_frac0.2 \
+  --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt \
+  --gate_tau_path voicebank/calib_perstep_alpha0.1_start_frac0.2/calib/_calib_tau.json \
+  --gate_max_restarts 5 \
+  --gate_seed 0 \
+  --gate_start_frac 0.2
+
+# Metrics
+  python calc_metrics.py \
+  --clean_dir voicebank/test_clean \
+  --noisy_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_perstep_alpha0.1_start_frac0.2
+
+
+
+
+
+
+
+# ============= the important part: oracle runs ==============
+# Oracle Gain on all processed files (not just worst-q%)
+cd /home/dsi/mayavb/PythonProjects/sgmse && python oracle_resample_eval.py \
+  --test_dir voicebank/test_noisy \
+  --clean_dir voicebank/test_clean \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --work_dir voicebank/oracle_exp_full \
+  --q_percent 100 \
+  --K_list 1 2 5 10 \
+  --seed_base 100 \
+  --enhancement_cmd "python enhancement.py --test_dir voicebank/test_noisy --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt" \
+  --metrics_cmd "python calc_metrics.py --clean_dir voicebank/test_clean --noisy_dir voicebank/test_noisy"
+
+
+cd /home/dsi/mayavb/PythonProjects/sgmse && python oracle_resample_eval_pesq.py \
+  --test_dir voicebank/test_noisy \
+  --clean_dir voicebank/test_clean \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --work_dir voicebank/oracle_exp_pesq \
+  --q_percent 50 \
+  --K_list 1 2 5 8 \
+  --seed_base 100 \
+  --enhancement_cmd "python enhancement.py --test_dir voicebank/test_noisy --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt" \
+  --metrics_cmd "python calc_metrics.py --clean_dir voicebank/test_clean --noisy_dir voicebank/test_noisy"
+
+# smaller set
+cd /home/dsi/mayavb/PythonProjects/sgmse && python oracle_resample_eval_pesq.py \
+  --test_dir voicebank/test_noisy \
+  --clean_dir voicebank/test_clean \
+  --baseline_enhanced_dir voicebank/test_enhanced_baseline \
+  --work_dir voicebank/oracle_exp_pesq_full \
+  --q_percent 100 \
+  --K_list 1 2 5 10 \
+  --seed_base 100 \
+  --enhancement_cmd "python enhancement.py --test_dir voicebank/test_noisy --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt" \
+  --metrics_cmd "python calc_metrics.py --clean_dir voicebank/test_clean --noisy_dir voicebank/test_noisy"
+
+
+# Full run — all four proxy scores + DNSMOS:
+python threshold_sweep_eval.py \
+  --tries_root voicebank/oracle_exp_full \
+  --clean_dir  voicebank/test_clean \
+  --noisy_dir  voicebank/test_noisy \
+  --work_dir   voicebank/threshold_sweep_exp \
+  --K_high 10 \
+  --scores leakage stft_leakage wiener_residual nisqa \
+  --n_tau 60 \
+  --compute_dnsmos
+
+# run enhancment- posthok-sampeling
+CUDA_VISIBLE_DEVICES=1 python enhancement.py \
+  --policy adaptive_k \
+  --adaptive_tau 0.004865634001638538 \
+  --adaptive_kmax 10 \
+  --test_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_adaptiveK_tau0.004865634001638538 \
+  --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt \
+  --gate_seed 0
+
+  # stronget setting:
+  CUDA_VISIBLE_DEVICES=1 python enhancement.py \
+  --policy adaptive_k \
+  --adaptive_tau 0.0015 \
+  --adaptive_kmax 10 \
+  --test_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_adaptiveK_tau0.0015\
+  --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt \
+  --gate_seed 0
+
+# run enhancment- diff-sampeling
+CUDA_VISIBLE_DEVICES=1 python enhancement.py \
+  --test_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_wr_tau0.00154 \
+  --ckpt checkpoints_updated/train_vb_29nqe0uh_epoch=115.ckpt \
+  --gate_tau_path voicebank/tau_wiener_residual_0.00154.json \
+  --gates wiener_residual \
+  --gate_max_restarts 5 \
+  --gate_seed 0
+
+
+python calc_metrics.py \
+  --clean_dir voicebank/test_clean \
+  --noisy_dir voicebank/test_noisy \
+  --enhanced_dir voicebank/test_enhanced_adaptiveK_tau0.0015
