@@ -321,7 +321,7 @@ if __name__ == '__main__':
     parser.add_argument("--gate_log_every", type=int, default=1, help="Subsample per-step score logging: store every N-th step (default: 1 = every step)")
     parser.add_argument("--gate_plot", action="store_true", help="Save gate diagnostic plots after inference (requires --gate_compute_tau)")
     parser.add_argument("--gate_alpha", type=float, default=0.1, help="Miscoverage level for conformal calibration; tau is saved to _calib_tau.json when --gate_compute_tau is set")
-    parser.add_argument("--gates", nargs="+", default=["leakage"], help='Gate names to use (default: ["leakage"]); supported: "leakage", "wiener_residual", "stft_leakage", "nisqa" (post-hoc only)')
+    parser.add_argument("--gates", nargs="+", default=["leakage"], help='Gate names to use (default: ["leakage"]); supported: "leakage", "wiener_residual", "stft_leakage" (per-step), "traj_jump", "traj_curvature", "pred_jump" (per-step, speech-agnostic), "nisqa" (post-hoc only)')
     parser.add_argument("--gate_combine", choices=["max", "mean"], default="max", help='How to combine scores from multiple gates (default: "max")')
     parser.add_argument("--gate_start_frac", type=float, default=0.0, help="Skip per-step gate scoring for the first gate_start_frac fraction of diffusion steps (0.0 = gate from step 0)")
     parser.add_argument("--gate_debug_file", type=str, default="", help="If non-empty, print per-step gate debug info only for this filename")
@@ -684,12 +684,26 @@ if __name__ == '__main__':
             )
 
             if args.gate_compute_tau:
-                # Trajectory log: records per-step scores for conformal calibration
+                # Trajectory log: records per-step scores for conformal calibration.
+                # s0 is None when all gates are per-step-only (traj_jump, traj_curvature);
+                # trajectory_score uses max(g_steps) in that case so the 0.0 sentinel
+                # stored here is never used for tau estimation.
                 traj_log = GateTrajectoryLog(gate_name="leakage_gate", example_id=filename)
-                traj_log.log_final(s0, attempt_idx=0)
+                traj_log.log_final(s0 if s0 is not None else 0.0, attempt_idx=0)
                 traj_log.finalize(0)
                 for _gs in _accepted_g_steps:
                     traj_log.log_step(_gs)
+                # Populate per-gate max from gate cache (written by per-step gate functions).
+                for _gname, _key_score, _key_step in [
+                    ("traj_jump",      "_traj_jump_max_score", "_traj_jump_max_step"),
+                    ("traj_curvature", "_traj_curv_max_score", "_traj_curv_max_step"),
+                    ("pred_jump",      "_pred_jump_max_score", "_pred_jump_max_step"),
+                ]:
+                    if _gname in args.gates and _key_score in _gate_cache:
+                        traj_log.gate_max_values[_gname] = _gate_cache[_key_score]
+                        traj_log.gate_max_steps[_gname]  = _gate_cache[_key_step]
+                traj_log.num_restarts      = _num_restarts
+                traj_log.first_reject_step = _first_reject_step
                 gate_traj_logs.append(traj_log)
 
             if args.gate_tau_path:
@@ -723,7 +737,7 @@ if __name__ == '__main__':
 
                 gate_log.append({
                     "filename": filename,
-                    "s0": round(s0, 6),
+                    "s0": round(s0, 6) if s0 is not None else "",
                     "num_restarts": _num_restarts,
                     "first_reject_step": _first_reject_step if _first_reject_step is not None else "",
                     "final_running_max": round(_final_running_max, 6) if _final_running_max is not None else "",
@@ -733,6 +747,12 @@ if __name__ == '__main__':
                     "DNSMOS_try0": _dnsmos_try0,
                     "DNSMOS_best": _dnsmos_best,
                     "delta_DNSMOS": _delta_dnsmos,
+                    "traj_jump_max":           round(_gate_cache["_traj_jump_max_score"], 6) if "traj_jump" in args.gates and "_traj_jump_max_score" in _gate_cache else "",
+                    "traj_jump_max_step":      _gate_cache.get("_traj_jump_max_step", "")    if "traj_jump" in args.gates else "",
+                    "traj_curvature_max":      round(_gate_cache["_traj_curv_max_score"], 6) if "traj_curvature" in args.gates and "_traj_curv_max_score" in _gate_cache else "",
+                    "traj_curvature_max_step": _gate_cache.get("_traj_curv_max_step", "")   if "traj_curvature" in args.gates else "",
+                    "pred_jump_max":           round(_gate_cache["_pred_jump_max_score"], 6) if "pred_jump" in args.gates and "_pred_jump_max_score" in _gate_cache else "",
+                    "pred_jump_max_step":      _gate_cache.get("_pred_jump_max_step", "")    if "pred_jump" in args.gates else "",
                 })
 
         if args.gate_calibration:
@@ -773,6 +793,24 @@ if __name__ == '__main__':
         print(f"alpha = {args.gate_alpha}  →  tau = {_calib['tau']:.4f}")
         print(f"n = {_calib['n']}  G_mean = {_calib['G_mean']:.4f}  G_std = {_calib['G_std']:.4f}")
         print(f"Saved to {_tau_out}")
+        _calib_log_path = join(_rd_calib, "gate_log.csv")
+        _calib_log_fields = ["filename", "G", "num_restarts", "first_reject_step"] + \
+            [f"{_g}_max"      for _g in args.gates] + \
+            [f"{_g}_max_step" for _g in args.gates]
+        with open(_calib_log_path, "w", newline="") as _clf:
+            _cwriter = csv.DictWriter(_clf, fieldnames=_calib_log_fields, extrasaction="ignore")
+            _cwriter.writeheader()
+            for _tl in gate_traj_logs:
+                _frs = getattr(_tl, "first_reject_step", None)
+                _crow = {"filename": _tl.example_id,
+                         "G": round(_tl.trajectory_score, 6),
+                         "num_restarts":      getattr(_tl, "num_restarts", 0),
+                         "first_reject_step": _frs if _frs is not None else ""}
+                for _g in args.gates:
+                    _crow[f"{_g}_max"]      = round(_tl.gate_max_values[_g], 6) if _g in _tl.gate_max_values else ""
+                    _crow[f"{_g}_max_step"] = _tl.gate_max_steps.get(_g, "")
+                _cwriter.writerow(_crow)
+        print(f"Gate trajectory log saved to {_calib_log_path}")
 
     if args.gate_tau_path:
         log_path = join(_rd_test, "_gate_log.csv")
@@ -781,7 +819,10 @@ if __name__ == '__main__':
                 "filename", "s0", "num_restarts", "first_reject_step",
                 "final_running_max", "gate_passed", "G_try0", "delta_G",
                 "DNSMOS_try0", "DNSMOS_best", "delta_DNSMOS",
-            ])
+                "traj_jump_max", "traj_jump_max_step",
+                "traj_curvature_max", "traj_curvature_max_step",
+                "pred_jump_max", "pred_jump_max_step",
+            ], extrasaction="ignore")
             _writer.writeheader()
             _writer.writerows(gate_log)
         print(f"Gate log saved to {log_path}")

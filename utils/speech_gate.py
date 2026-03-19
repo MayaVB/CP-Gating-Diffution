@@ -204,6 +204,249 @@ def gate_step_stft_leakage(step_info: dict, cache: dict) -> float:
     return float(np.mean(fp[non])) / (float(np.mean(fp[mask])) + eps)
 
 
+def gate_step_traj_jump(step_info: dict, cache: dict) -> float:
+    """Per-step trajectory-instability gate — speech-agnostic.
+
+    Measures the relative squared displacement of consecutive denoised latent
+    estimates (xt_mean).  A large jump indicates an unstable diffusion trajectory.
+
+    Formula (higher = worse, same convention as other per-step gates):
+
+        score = ||cur - prev||^2 / (||prev||^2 + eps)
+
+    where cur and prev are flattened float32 views of xt_mean[0] (batch item 0).
+
+    Cache keys read:
+        eps                        : float (default 1e-8)
+
+    Cache keys written (internal state — do NOT set externally):
+        _traj_jump_prev_xt_mean    : np.ndarray | None — previous step's xt_mean
+        _traj_jump_prev_step_idx   : int | None        — previous step_idx
+
+    Cache reset across attempts:
+        The cache dict is shared across all attempts of the same utterance.
+        A new attempt is detected when step_idx is non-monotonic
+        (step_idx <= _traj_jump_prev_step_idx), in which case stored state is
+        cleared and 0.0 is returned for that first step.
+
+    step_info keys (used):
+        step_idx : int           — diffusion step index
+        xt_mean  : torch.Tensor  — denoised estimate  [B, C, F, T_spec]
+
+    Returns:
+        float: relative squared displacement (higher = more unstable = worse).
+               0.0 on the first usable step of each attempt.
+    """
+    cur_tensor  = step_info["xt_mean"]          # [B, C, F, T_spec]
+    step_idx    = step_info["step_idx"]
+    eps         = cache.get("eps", 1e-8)
+
+    prev_tensor  = cache.get("_traj_jump_prev_xt_mean", None)
+    prev_step    = cache.get("_traj_jump_prev_step_idx", None)
+
+    # Detect attempt reset: step_idx is non-monotonic → new attempt started.
+    if prev_step is not None and step_idx <= prev_step:
+        prev_tensor = None
+        cache.pop("_traj_jump_max_score", None)
+        cache.pop("_traj_jump_max_step",  None)
+
+    # Keep xt_mean as complex: a single .ravel() gives a 1-D complex128/64 vector.
+    # np.vdot(a, b) = Σ conj(a_i)*b_i, so vdot(x, x).real = Σ |x_i|^2,
+    # which is the correct Hermitian (complex Euclidean) squared norm.
+    cur = cur_tensor[0].detach().cpu().numpy().ravel()
+
+    if prev_tensor is None:
+        # First usable step of this attempt: seed the cache and return 0.0.
+        cache["_traj_jump_prev_xt_mean"]  = cur
+        cache["_traj_jump_prev_step_idx"] = step_idx
+        return 0.0
+
+    prev = prev_tensor
+
+    diff  = cur - prev
+    score = float(np.vdot(diff, diff).real) / (float(np.vdot(prev, prev).real) + eps)
+
+    cache["_traj_jump_prev_xt_mean"]  = cur
+    cache["_traj_jump_prev_step_idx"] = step_idx
+
+    # Track running max for this attempt (read back by the caller after sampling).
+    if score > cache.get("_traj_jump_max_score", -float("inf")):
+        cache["_traj_jump_max_score"] = score
+        cache["_traj_jump_max_step"]  = step_idx
+
+    return score
+
+
+def gate_step_traj_curvature(step_info: dict, cache: dict) -> float:
+    """Per-step trajectory-curvature gate — speech-agnostic.
+
+    Measures the second difference of consecutive denoised latent estimates
+    (xt_mean), i.e. the discrete curvature of the diffusion trajectory.  A large
+    curvature indicates the sampler is bending sharply, which is a sign of
+    instability.
+
+    Formula (higher = worse, same convention as other per-step gates):
+
+        score = ||cur - 2*prev1 + prev2||^2 / (||prev1||^2 + eps)
+
+    where cur, prev1, prev2 are flattened float32 views of xt_mean[0]:
+        cur   — this step's denoised estimate
+        prev1 — one step ago
+        prev2 — two steps ago
+
+    The first two usable steps of each attempt return 0.0 while the history
+    is being seeded.
+
+    Cache keys written (internal state — do NOT set externally):
+        _traj_curv_prev1         : np.ndarray | None — xt_mean from one step ago
+        _traj_curv_prev2         : np.ndarray | None — xt_mean from two steps ago
+        _traj_curv_prev_step_idx : int | None        — previous step_idx
+
+    Cache reset across attempts:
+        Same monotonicity check as gate_step_traj_jump: if the incoming step_idx
+        is <= the last recorded step_idx, both history buffers are cleared and
+        the function seeds fresh state for the new attempt.
+
+    step_info keys (used):
+        step_idx : int           — diffusion step index (always present)
+        xt_mean  : torch.Tensor  — denoised estimate  [B, C, F, T_spec]
+
+    Returns:
+        float: normalised squared second difference (higher = more curved = worse).
+               0.0 on the first two usable steps of each attempt.
+    """
+    cur_tensor = step_info["xt_mean"]          # [B, C, F, T_spec]
+    step_idx   = step_info["step_idx"]
+    eps        = cache.get("eps", 1e-8)
+
+    prev1     = cache.get("_traj_curv_prev1", None)          # one step ago
+    prev2     = cache.get("_traj_curv_prev2", None)          # two steps ago
+    prev_step = cache.get("_traj_curv_prev_step_idx", None)
+
+    # Detect attempt reset: non-monotonic step_idx means a new attempt started.
+    if prev_step is not None and step_idx <= prev_step:
+        prev1 = None
+        prev2 = None
+        cache.pop("_traj_curv_max_score", None)
+        cache.pop("_traj_curv_max_step",  None)
+
+    # Keep xt_mean as complex; use np.vdot for correct Hermitian squared norms
+    # (same pattern as gate_step_traj_jump).
+    cur = cur_tensor[0].detach().cpu().numpy().ravel()
+
+    if prev1 is None:
+        # First step of this attempt: seed prev1, no history yet.
+        cache["_traj_curv_prev1"]          = cur
+        cache["_traj_curv_prev2"]          = None
+        cache["_traj_curv_prev_step_idx"]  = step_idx
+        return 0.0
+
+    if prev2 is None:
+        # Second step: shift prev1 → prev2, store cur as prev1.
+        cache["_traj_curv_prev2"]          = prev1
+        cache["_traj_curv_prev1"]          = cur
+        cache["_traj_curv_prev_step_idx"]  = step_idx
+        return 0.0
+
+    # Third+ step: we have a full three-point history; compute curvature.
+    second_diff = cur - 2.0 * prev1 + prev2
+    numer = float(np.vdot(second_diff, second_diff).real)
+    denom = float(np.vdot(prev1, prev1).real) + eps
+    score = numer / denom
+
+    # Shift history forward.
+    cache["_traj_curv_prev2"]          = prev1
+    cache["_traj_curv_prev1"]          = cur
+    cache["_traj_curv_prev_step_idx"]  = step_idx
+
+    # Track running max for this attempt (read back by the caller after sampling).
+    if score > cache.get("_traj_curv_max_score", -float("inf")):
+        cache["_traj_curv_max_score"] = score
+        cache["_traj_curv_max_step"]  = step_idx
+
+    return score
+
+
+def gate_step_pred_jump(step_info: dict, cache: dict) -> float:
+    """Per-step model-prediction-jump gate — speech-agnostic.
+
+    Measures the relative squared displacement between the model prediction
+    (score) at consecutive diffusion steps.  Uses step_info["model_pred"],
+    the raw network score ∇_x log p(x_t | y) exposed by the PC sampler.
+
+    Formula (higher = worse, same convention as other per-step gates):
+
+        score = ||cur - prev||^2 / (||prev||^2 + eps)
+
+    where cur and prev are flattened complex numpy arrays of model_pred[0]
+    (batch item 0).  Norms are computed via np.vdot for the correct Hermitian
+    (complex Euclidean) squared norm, identical to gate_step_traj_jump.
+
+    Returns 0.0 if step_info["model_pred"] is None (e.g. NonePredictor).
+
+    Cache keys read:
+        eps                      : float (default 1e-8)
+
+    Cache keys written (internal state — do NOT set externally):
+        _pred_jump_prev_pred     : np.ndarray | None — previous step's model_pred
+        _pred_jump_prev_step_idx : int | None        — previous step_idx
+
+    Cache reset across attempts:
+        A new attempt is detected when step_idx is non-monotonic
+        (step_idx <= _pred_jump_prev_step_idx), in which case stored state is
+        cleared and 0.0 is returned for that first step.
+
+    step_info keys (used):
+        step_idx   : int                    — diffusion step index
+        model_pred : torch.Tensor | None    — network score [B, C, F, T_spec]
+
+    Returns:
+        float: relative squared displacement of model prediction (higher = worse).
+               0.0 on the first usable step of each attempt, or if model_pred is None.
+    """
+    model_pred = step_info.get("model_pred", None)
+    if model_pred is None:
+        return 0.0
+
+    step_idx = step_info["step_idx"]
+    eps      = cache.get("eps", 1e-8)
+
+    prev_pred = cache.get("_pred_jump_prev_pred", None)
+    prev_step = cache.get("_pred_jump_prev_step_idx", None)
+
+    # Detect attempt reset: step_idx is non-monotonic → new attempt started.
+    if prev_step is not None and step_idx <= prev_step:
+        prev_pred = None
+        cache.pop("_pred_jump_max_score", None)
+        cache.pop("_pred_jump_max_step",  None)
+
+    # Flatten batch item 0 to a 1-D complex array.
+    # np.vdot(a, b) = Σ conj(a_i)*b_i, so vdot(x, x).real = Σ |x_i|^2,
+    # which is the correct Hermitian squared norm for complex tensors.
+    cur = model_pred[0].detach().cpu().numpy().ravel()
+
+    if prev_pred is None:
+        # First usable step of this attempt: seed the cache and return 0.0.
+        cache["_pred_jump_prev_pred"]     = cur
+        cache["_pred_jump_prev_step_idx"] = step_idx
+        return 0.0
+
+    prev = prev_pred
+
+    diff  = cur - prev
+    score = float(np.vdot(diff, diff).real) / (float(np.vdot(prev, prev).real) + eps)
+
+    cache["_pred_jump_prev_pred"]     = cur
+    cache["_pred_jump_prev_step_idx"] = step_idx
+
+    # Track running max for this attempt (read back by the caller after sampling).
+    if score > cache.get("_pred_jump_max_score", -float("inf")):
+        cache["_pred_jump_max_score"] = score
+        cache["_pred_jump_max_step"]  = step_idx
+
+    return score
+
+
 def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> dict:
     """Return {gate_name: score} for each requested gate at this diffusion step.
 
@@ -216,6 +459,15 @@ def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> d
                              spectrogram (sum over F then mean per region).  Matches
                              the post-hoc _stft_leakage_score exactly.
                              Higher = more leakage = worse.
+        "traj_jump"        — Relative squared displacement between consecutive
+                             xt_mean tensors.  Speech-agnostic trajectory instability.
+                             Higher = larger jump = worse.
+        "traj_curvature"   — Normalised squared second difference of consecutive
+                             xt_mean tensors.  Discrete curvature of the trajectory.
+                             Higher = sharper bend = worse.
+        "pred_jump"        — Relative squared displacement between consecutive
+                             model prediction (score) tensors.  Speech-agnostic.
+                             Higher = larger jump in score = worse.
 
     Adding a new gate requires registering it in the if/elif chain below.
     """
@@ -227,6 +479,12 @@ def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> d
             scores["wiener_residual"] = gate_step_wiener_residual(step_info, cache)
         elif gate == "stft_leakage":
             scores["stft_leakage"] = gate_step_stft_leakage(step_info, cache)
+        elif gate == "traj_jump":
+            scores["traj_jump"] = gate_step_traj_jump(step_info, cache)
+        elif gate == "traj_curvature":
+            scores["traj_curvature"] = gate_step_traj_curvature(step_info, cache)
+        elif gate == "pred_jump":
+            scores["pred_jump"] = gate_step_pred_jump(step_info, cache)
     return scores
 
 
@@ -295,6 +553,8 @@ class GateTrajectoryLog:
     attempt_scores: List[float] = field(default_factory=list)   # score per attempt
     accepted_attempt_idx: Optional[int] = None                  # which attempt was kept
     g_steps: List[float] = field(default_factory=list)          # per-step scores for accepted attempt
+    gate_max_values: dict = field(default_factory=dict)         # gate_name -> max per-step score (accepted attempt)
+    gate_max_steps:  dict = field(default_factory=dict)         # gate_name -> step_idx of that max
 
     def log_final(self, score: float, attempt_idx: int = 0, accepted: bool = False) -> None:
         """
@@ -460,13 +720,19 @@ def _wiener_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     return min(E_resid / (E_speech + _EPS), 1e6)
 
 
+# Gates that operate exclusively on per-step xt_mean inside the sampler callback.
+# They have no meaningful post-hoc implementation on the final waveform, so
+# compute_posthoc_gate_score returns None when all requested gates are in this set.
+_PERSTEP_ONLY_GATES = frozenset({"traj_jump", "traj_curvature", "pred_jump"})
+
+
 def compute_posthoc_gate_score(
     gates: list,
     y_np: np.ndarray,
     x_hat_np: np.ndarray,
     gate_combine: str = "max",
     sr: int = None,
-) -> float:
+) -> Optional[float]:
     """Post-hoc gate score on the final waveform.  Convention: lower = worse.
 
     gates       : list of gate names (same as --gates in enhancement.py)
@@ -475,14 +741,22 @@ def compute_posthoc_gate_score(
     gate_combine: "max" or "mean" — how to combine multiple gates
     sr          : sample rate of x_hat_np in Hz (required for "nisqa")
 
+    Returns None when all requested gates are per-step-only (traj_jump,
+    traj_curvature) and therefore have no post-hoc waveform score.
+
     Gate directions:
         leakage          lower = better (less noise leaked through)
         wiener_residual  lower = better (less residual noise)
         stft_leakage     lower = better (less power in silence frames)
         nisqa            higher = better → negated so convention stays lower = worse
+        traj_jump        per-step only — skipped here, returns None if sole gate
+        traj_curvature   per-step only — skipped here, returns None if sole gate
+        pred_jump        per-step only — skipped here, returns None if sole gate
     """
     scores = {}
     for gate in gates:
+        if gate in _PERSTEP_ONLY_GATES:
+            continue  # per-step only; no post-hoc waveform score available
         if gate == "leakage":
             mask = _speech_mask(y_np)
             scores["leakage"] = compute_speech_gate_score(y_np, x_hat_np, mask)
@@ -497,4 +771,6 @@ def compute_posthoc_gate_score(
             raw = compute_nisqa(x_hat_np, sr)
             # Negate: nisqa is higher = better; convention here is lower = worse
             scores["nisqa"] = -float(raw) if raw is not None else 0.0
+    if not scores:
+        return None  # all requested gates are per-step-only; no post-hoc score
     return combine_gate_scores(scores, gate_combine)

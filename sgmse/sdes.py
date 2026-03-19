@@ -130,7 +130,9 @@ class SDE(abc.ABC):
             def discretize(self, x, y, t, stepsize):
                 """Create discretized iteration rules for the reverse diffusion sampler."""
                 f, G = discretize_fn(x, y, t, stepsize)
-                rev_f = f - G[:, None, None, None] ** 2 * score_model(x, y, t) * (0.5 if self.probability_flow else 1.)
+                score = score_model(x, y, t)
+                self._last_score = score
+                rev_f = f - G[:, None, None, None] ** 2 * score * (0.5 if self.probability_flow else 1.)
                 rev_G = torch.zeros_like(G) if self.probability_flow else G
                 return rev_f, rev_G
 

@@ -69,6 +69,7 @@ def get_pc_sampler(
                         "t": float(t.item()),
                         "xt": xt,
                         "xt_mean": xt_mean,
+                        "model_pred": getattr(predictor.rsde, '_last_score', None),
                     })
             x_result = xt_mean if denoise else xt
             ns = sde.N * (corrector.n_steps + 1)
