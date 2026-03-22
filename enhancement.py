@@ -1,4 +1,5 @@
 import glob
+import json
 import os
 import random
 import csv
@@ -301,6 +302,74 @@ def _run_adaptive_k_sampling(
     return x_hats[chosen_try], adaptive_kmax, chosen_try, d0, best_score, True
 
 
+def _run_mid_wiener_sampling(
+    build_sampler,
+    mid_wiener_step,
+    mid_wiener_kmax,
+    base_seed,
+    gate_cache,
+    model,
+    T_orig,
+    norm_factor,
+):
+    """Mid-step Wiener score-logging with multi-try selection (pure logging mode).
+
+    Runs ALL mid_wiener_kmax tries to completion — no aborting, no running-max,
+    no tau threshold during inference.  At step_idx == mid_wiener_step a single
+    Wiener-residual score is recorded from the intermediate latent estimate.
+    The try with the lowest mid-step score is returned (argmin selection).
+    Tau-based gating is applied offline via sweep_mid_wiener_tau.py.
+
+    Parameters
+    ----------
+    build_sampler     : callable(step_callback=None) → sampler
+    mid_wiener_step   : int   — diffusion step index at which to score
+    mid_wiener_kmax   : int   — total number of tries (all run to completion)
+    base_seed         : int or None — try j uses base_seed+j; None = no seeding
+    gate_cache        : dict  — must contain 'speech_mask_frames' and 'eps'
+    model             : ScoreModel
+    T_orig            : int   — original waveform length (for model.to_audio)
+    norm_factor       : float — amplitude normalisation factor
+
+    Returns
+    -------
+    x_hat_best    : enhanced waveform of the argmin-score try, scaled by norm_factor
+    scores        : list[float] — mid-step Wiener score for each try
+    chosen_try    : int         — 0-based index of the argmin-score try
+    effective_k   : int         — mid_wiener_kmax (all tries were run)
+    """
+    from utils.speech_gate import gate_step_wiener_residual
+
+    scores       = []
+    best_score   = float("inf")
+    best_x_hat   = None
+    chosen_try   = 0
+
+    for _t in range(mid_wiener_kmax):
+        _score_box = [None]   # mutable single-element container; mutated by callback
+
+        def _step_cb(_si, _sb=_score_box, _cache=gate_cache, _target=mid_wiener_step):
+            if _si["step_idx"] == _target:
+                _sb[0] = gate_step_wiener_residual(_si, _cache)
+
+        if base_seed is not None:
+            _set_seeds(base_seed + _t)
+
+        sample, _ = build_sampler(step_callback=_step_cb)()
+        x_hat_t = model.to_audio(sample.squeeze(), T_orig) * norm_factor
+
+        # Sentinel for edge case where target step was never reached (step >= N)
+        _score = _score_box[0] if _score_box[0] is not None else float("inf")
+        scores.append(_score)
+
+        if _score < best_score:
+            best_score = _score
+            best_x_hat = x_hat_t
+            chosen_try = _t
+
+    return best_x_hat, scores, chosen_try, mid_wiener_kmax
+
+
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--test_dir", type=str, required=True, help='Directory containing the test data')
@@ -343,10 +412,26 @@ if __name__ == '__main__':
                              "Required when --policy adaptive_k.")
     parser.add_argument("--adaptive_kmax", type=int, default=10,
                         help="Max number of tries for adaptive_k escalation (default: 10)")
+    # --- Mid-step Wiener gating args ---
+    parser.add_argument("--mid_wiener_enable", action="store_true",
+                        help="Enable mid-step Wiener gating policy (mutually exclusive with --policy adaptive_k)")
+    parser.add_argument("--mid_wiener_step", type=int, default=None,
+                        help="Diffusion step index at which to score each try; required with --mid_wiener_enable")
+    parser.add_argument("--mid_wiener_tau", type=float, default=None,
+                        help="Unused during inference (tau is swept offline by sweep_mid_wiener_tau.py); "
+                             "stored as metadata in mid_wiener_log.csv if provided")
+    parser.add_argument("--mid_wiener_kmax", type=int, default=10,
+                        help="Maximum number of tries for mid-step Wiener gating (default: 10)")
     args = parser.parse_args()
 
     if args.policy == "adaptive_k" and args.adaptive_tau is None:
         raise ValueError("--adaptive_tau is required when --policy adaptive_k")
+
+    if args.mid_wiener_enable:
+        if args.mid_wiener_step is None:
+            raise ValueError("--mid_wiener_step is required when --mid_wiener_enable")
+        if args.policy == "adaptive_k":
+            raise ValueError("--mid_wiener_enable and --policy adaptive_k are mutually exclusive")
 
     # --- Adaptive-K: warn once about legacy-only args that are active but will be ignored ---
     if args.policy == "adaptive_k":
@@ -489,6 +574,8 @@ if __name__ == '__main__':
 
     # Per-utterance log for adaptive_k mode (None in legacy mode so accidental use raises early)
     _ak_log = [] if args.policy == "adaptive_k" else None
+    # Per-utterance log for mid_wiener mode
+    _mw_log = [] if args.mid_wiener_enable else None
 
     # Enhance files
     for _utt_idx, noisy_file in enumerate(tqdm(noisy_files)):
@@ -548,13 +635,59 @@ if __name__ == '__main__':
             write(_wav_path, _wav_k, target_sr)
 
         # -----------------------------------------------------------------------
-        # Dispatch: three mutually exclusive inference paths
-        #   1. adaptive_k  — reference-free difficulty-based K escalation (this block)
+        # Dispatch: mutually exclusive inference paths
+        #   0. mid_wiener  — mid-step Wiener gating with multi-try selection
+        #   1. adaptive_k  — reference-free difficulty-based K escalation
         #   2. legacy CP   — per-step gate + restart (gate_tau_path / gate_compute_tau)
         #   3. plain       — single-pass diffusion, no gating
         # Legacy gating args (gate_tau_path, gate_compute_tau, gates, gate_combine, …)
         # are intentionally ignored in adaptive_k mode; a startup warning lists them.
         # -----------------------------------------------------------------------
+        if args.mid_wiener_enable:
+            _yf_power = (Y[0].abs() ** 2).sum(dim=(0, 1)).detach().cpu().numpy()
+            _mw_cache = {
+                "speech_mask_frames": _yf_power > np.percentile(_yf_power, 80),
+                "eps": 1e-8,
+            }
+            _mw_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
+            (x_hat,
+             _mw_scores,
+             _mw_chosen_try,
+             _mw_effective_k) = _run_mid_wiener_sampling(
+                build_sampler=_build_sampler,
+                mid_wiener_step=args.mid_wiener_step,
+                mid_wiener_kmax=args.mid_wiener_kmax,
+                base_seed=_mw_base_seed,
+                gate_cache=_mw_cache,
+                model=model,
+                T_orig=T_orig,
+                norm_factor=norm_factor,
+            )
+            _mw_score_try0   = _mw_scores[0]
+            _mw_chosen_score = _mw_scores[_mw_chosen_try]
+            print(f"[mid_wiener] file={filename}  utt_idx={_utt_idx}  "
+                  f"base_seed={_mw_base_seed}  effective_k={_mw_effective_k}  "
+                  f"score_try0={_mw_score_try0:.4f}  "
+                  f"chosen_try={_mw_chosen_try}  chosen_score={_mw_chosen_score:.4f}")
+            _mw_scores_finite = [s if s != float("inf") else None for s in _mw_scores]
+            _mw_log.append({
+                "utterance_idx":   _utt_idx,
+                "filename":        filename,
+                "base_seed_used":  _mw_base_seed,
+                "mid_wiener_step": args.mid_wiener_step,
+                "mid_wiener_kmax": args.mid_wiener_kmax,
+                "effective_k":     _mw_effective_k,
+                "score_try0":      round(float(_mw_score_try0), 6) if _mw_score_try0 != float("inf") else "",
+                "chosen_try":      _mw_chosen_try,
+                "chosen_score":    round(float(_mw_chosen_score), 6) if _mw_chosen_score != float("inf") else "",
+                "scores_all":      json.dumps([round(float(s), 6) if s is not None else None
+                                               for s in _mw_scores_finite]),
+            })
+            makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
+            write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
+            _save_steps_utt_idx[0] += 1
+            continue
+
         if args.policy == "adaptive_k":
             y_np = y.squeeze().cpu().numpy()
             # Per-utterance base seed: deterministic from gate_seed + utterance index.
@@ -777,6 +910,26 @@ if __name__ == '__main__':
             write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
 
         _save_steps_utt_idx[0] += 1
+
+    if args.mid_wiener_enable and _mw_log:
+        _mw_csv_path = join(args.enhanced_dir, "mid_wiener_log.csv")
+        _mw_fields = ["utterance_idx", "filename", "base_seed_used",
+                      "mid_wiener_step", "mid_wiener_kmax",
+                      "effective_k", "score_try0", "chosen_try", "chosen_score",
+                      "scores_all"]
+        with open(_mw_csv_path, "w", newline="") as _f:
+            _writer = csv.DictWriter(_f, fieldnames=_mw_fields)
+            _writer.writeheader()
+            _writer.writerows(_mw_log)
+        _n_mw = len(_mw_log)
+        _mean_chosen_try = sum(r["chosen_try"] for r in _mw_log) / _n_mw
+        _n_chose_try0 = sum(1 for r in _mw_log if r["chosen_try"] == 0)
+        print(f"\nMid-Wiener log saved to {_mw_csv_path}")
+        print("\n--- Mid-Wiener Run Summary ---")
+        print(f"n_files             = {_n_mw}")
+        print(f"mean_chosen_try     = {_mean_chosen_try:.2f}")
+        print(f"n_chose_try0        = {_n_chose_try0}  ({_n_chose_try0 / _n_mw:.1%})")
+        print(f"sweep tau offline:    python sweep_mid_wiener_tau.py --log_csv {_mw_csv_path}")
 
     if args.gate_compute_tau:
         if args.gate_plot:
