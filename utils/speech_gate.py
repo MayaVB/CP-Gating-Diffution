@@ -720,6 +720,75 @@ def _wiener_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     return min(E_resid / (E_speech + _EPS), 1e6)
 
 
+def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
+    """OM-LSA-inspired post-hoc residual gate.  Lower = better.
+
+    Estimates per-frequency noise PSD via smoothed minimum statistics
+    (MCRA-style) rather than the plain median used by wiener_residual.
+    The power spectrum of x_hat is exponentially smoothed over time;
+    the minimum of the smoothed spectrum across non-speech frames is
+    used as the noise floor per frequency bin.
+
+    On speech frames, power is split into:
+        speech-excess : max(S - alpha * N_hat, 0)
+        residual      : min(S, alpha * N_hat)
+
+    Score = E_resid / (E_speech + eps).
+    Returns 0.0 on edge cases (too few speech / non-speech frames).
+    Clamped to 1e6 to match wiener_residual behaviour.
+    """
+    import librosa
+
+    _EPS         = 1e-8
+    N_FFT        = 512
+    HOP          = 128
+    _ALPHA       = 1.0   # noise over-subtraction factor (same as Wiener path)
+    _SMOOTH_COEF = 0.7   # MCRA-style exponential smoothing coefficient
+
+    T     = min(len(y), len(x_hat))
+    y     = np.asarray(y[:T],     dtype=np.float32)
+    x_hat = np.asarray(x_hat[:T], dtype=np.float32)
+
+    speech_mask_samples = _speech_mask(y)
+    win = np.hanning(N_FFT).astype(np.float32)
+    S   = np.abs(librosa.stft(x_hat, n_fft=N_FFT, hop_length=HOP,
+                               win_length=N_FFT, window=win)) ** 2  # [F, T_frames]
+
+    # Frame-level VAD mask (same convention as _wiener_residual_score)
+    n_frames   = S.shape[1]
+    frame_mask = np.zeros(n_frames, dtype=bool)
+    for t in range(n_frames):
+        start = t * HOP
+        end   = min(start + N_FFT, len(speech_mask_samples))
+        if start < len(speech_mask_samples):
+            frame_mask[t] = np.mean(speech_mask_samples[start:end]) > 0.5
+
+    non_mask = ~frame_mask
+    if non_mask.sum() < 5 or frame_mask.sum() < 10:
+        return 0.0
+
+    # MCRA-style noise PSD: exponentially smooth spectrum over time,
+    # then take the minimum across non-speech frames per frequency bin.
+    # This tracks the noise floor more aggressively than the median (Wiener)
+    # and is the core idea of minimum-statistics noise estimation.
+    P_smooth = np.empty_like(S)
+    P_smooth[:, 0] = S[:, 0]
+    for t in range(1, n_frames):
+        P_smooth[:, t] = (_SMOOTH_COEF * P_smooth[:, t - 1]
+                          + (1.0 - _SMOOTH_COEF) * S[:, t])
+
+    N_f = P_smooth[:, non_mask].min(axis=1)   # [F] — minimum statistics per bin
+    N_f = np.maximum(N_f, _EPS)
+
+    S_speech   = S[:, frame_mask]                                      # [F, N_speech]
+    speech_est = np.maximum(S_speech - _ALPHA * N_f[:, None], 0.0)
+    resid_est  = np.minimum(S_speech, _ALPHA * N_f[:, None])
+
+    E_speech = float(speech_est.sum())
+    E_resid  = float(resid_est.sum())
+    return min(E_resid / (E_speech + _EPS), 1e6)
+
+
 # Gates that operate exclusively on per-step xt_mean inside the sampler callback.
 # They have no meaningful post-hoc implementation on the final waveform, so
 # compute_posthoc_gate_score returns None when all requested gates are in this set.

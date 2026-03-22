@@ -233,15 +233,17 @@ def _run_adaptive_k_sampling(
     T_orig,
     norm_factor,
     y_np,
+    adaptive_score="wiener_residual",
 ):
     """Adaptive-K inference policy: binary escalation based on baseline difficulty.
 
-    Score metric: wiener_residual (reference-free, lower = better).
+    Score metric: selected by adaptive_score (reference-free, lower = better).
+    Supported: "wiener_residual", "omlsa_residual".
 
     Algorithm
     ---------
     1. Generate baseline sample x0 (try 0).
-    2. Compute d0 = wiener_residual(x0).
+    2. Compute d0 = score(x0).
     3. If d0 <= adaptive_tau: return x0 (no escalation, K=1).
     4. Else: generate tries 1..adaptive_kmax-1, score each,
              return the try with the lowest score (including try 0).
@@ -259,21 +261,27 @@ def _run_adaptive_k_sampling(
     T_orig          : int   — original waveform length (for model.to_audio)
     norm_factor     : float — amplitude normalisation factor used pre-inference
     y_np            : np.ndarray [T] — normalised noisy input (for score computation)
+    adaptive_score  : str — score function name; "wiener_residual" or "omlsa_residual"
 
     Returns
     -------
     x_hat        : best enhanced waveform tensor [T], scaled by norm_factor
     chosen_k     : 1 if not escalated, adaptive_kmax if escalated
     chosen_try   : index (0-based) of the selected try
-    d0           : baseline difficulty score (wiener_residual of try 0)
-    best_score   : wiener_residual score of the selected try
+    d0           : baseline difficulty score of try 0
+    best_score   : score of the selected try
     escalated    : True if extra tries were generated
     """
-    from utils.speech_gate import _wiener_residual_score
+    if adaptive_score == "wiener_residual":
+        from utils.speech_gate import _wiener_residual_score as _score_fn
+    elif adaptive_score == "omlsa_residual":
+        from utils.speech_gate import _omlsa_residual_score as _score_fn
+    else:
+        raise ValueError(f"Unknown adaptive_score: {adaptive_score!r}")
 
     def _score(x_hat_tensor):
-        """Wiener residual score for adaptive-K waveform selection (lower = better)."""
-        return _wiener_residual_score(y_np, (x_hat_tensor / norm_factor).cpu().numpy())
+        """Post-hoc score for adaptive-K waveform selection (lower = better)."""
+        return _score_fn(y_np, (x_hat_tensor / norm_factor).cpu().numpy())
 
     # --- Try 0: baseline ---
     if base_seed is not None:
@@ -405,7 +413,7 @@ if __name__ == '__main__':
     parser.add_argument("--policy", choices=["legacy", "adaptive_k"], default="legacy",
                         help="Inference policy: 'legacy' = existing per-step gate/restart (default); "
                              "'adaptive_k' = reference-free difficulty-based K escalation")
-    parser.add_argument("--adaptive_score", choices=["wiener_residual"], default="wiener_residual",
+    parser.add_argument("--adaptive_score", choices=["wiener_residual", "omlsa_residual"], default="wiener_residual",
                         help="Post-hoc score used for adaptive-K difficulty and selection (default: wiener_residual)")
     parser.add_argument("--adaptive_tau", type=float, default=None,
                         help="Difficulty threshold for adaptive_k policy: if d0 > tau, escalate to K_max tries. "
@@ -708,6 +716,7 @@ if __name__ == '__main__':
                 T_orig=T_orig,
                 norm_factor=norm_factor,
                 y_np=y_np,
+                adaptive_score=args.adaptive_score,
             )
             print(f"[adaptive_k] file={filename}  utt_idx={_utt_idx}  "
                   f"base_seed={_ak_base_seed}  d0={_ak_d0:.4f}  "
