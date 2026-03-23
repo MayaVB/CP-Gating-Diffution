@@ -721,25 +721,20 @@ def _wiener_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
 
 
 def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
-    """Cohen-style OM-LSA / IMCRA-inspired gate score. Lower = better.
+    """OM-LSA-inspired post-hoc residual gate. Lower = better.
 
-    This is a post-hoc scalar score for adaptive-K gating, not a full enhancer.
+    This version keeps the successful op2 ingredients:
+      - Cohen-style recursive noise tracking from noisy y
+      - PH1 soft speech presence probability
+      - local/global/frame decisions
+      - tonal-aware logic
 
-    It follows the structure of Israel Cohen's MATLAB OM-LSA code:
-      - STFT with M=512 and 75% overlap
-      - frequency smoothing
-      - smoothed spectra S, St
-      - local minima tracking
-      - IMCRA-style noise recursion
-      - xi_local / xi_global / xi_frame decisions
-      - q -> PH1 -> GH1 / GH0 -> G
+    It amplifies op2 by:
+      1) upweighting hard frames using P_frame
+      2) adding a small speech-hole term
+      3) adding an explicit tonal penalty on bins flagged by Cohen-style tonal logic
 
-    Final score:
-      - use PH1 as a soft speech-likelihood mask
-      - keep the proxy close to Wiener-style residual logic
-      - do NOT force x_hat to match the OM-LSA target directly
-
-    Lower score means better candidate.
+    Still a gating score, not an enhancer.
     """
     import numpy as np
     import librosa
@@ -748,7 +743,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     EPS = 1e-10
     MAX_SCORE = 1e6
 
-    # ===== Parameters from Cohen-style OM-LSA / IMCRA =====
+    # ===== Cohen / OM-LSA params =====
     Fs_ref = 16000.0
     M_ref = 512
     Mo_ref = int(0.75 * M_ref)
@@ -787,6 +782,13 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     tone_flag = True
     nonstat = "medium"
 
+    # ===== New score weights =====
+    FRAME_BOOST = 0.75      # harder frames count more
+    W_SPEECH_RESID = 0.70   # keep op2 baseline
+    W_NOISE_EXCESS = 1.00   # keep op2 baseline
+    W_SPEECH_HOLE = 0.18    # small, not dominant
+    W_TONAL = 0.35          # explicit tonal penalty
+
     # ===== Basic setup =====
     T = min(len(y), len(x_hat))
     if T <= 0:
@@ -798,7 +800,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     Fs = Fs_ref
     M = M_ref
     Mo = Mo_ref
-    Mno = M - Mo  # hop = 128
+    Mno = M - Mo
     alpha_s = alpha_s_ref
     alpha_d = alpha_d_ref
     alpha_eta = alpha_eta_ref
@@ -891,7 +893,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
         eta = np.maximum(eta, eta_min)
         v = gamma * eta / (1.0 + eta)
 
-        # 2.1 smooth over frequency
+        # 2.1 frequency smoothing
         Sf = _conv_same(Ya2, b)
 
         if l == 0:
@@ -960,6 +962,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
             alpha_dt_long = alpha_d_long + (1.0 - alpha_d_long) * phat
             lambda_dav_long = alpha_dt_long * lambda_dav_long + (1.0 - alpha_dt_long) * Ya2
 
+        # sliding minima window
         l_mod_lswitch += 1
         if l_mod_lswitch == Vwin:
             l_mod_lswitch = 0
@@ -981,7 +984,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
             lambda_d = 1.4685 * lambda_dav
         lambda_d = np.maximum(lambda_d, EPS)
 
-        # 4. A priori probability of signal absence
+        # ===== A priori probability of signal absence =====
         xi = alpha_xi * xi + (1.0 - alpha_xi) * eta
         xi_local = _conv_same(xi, b_xi_local)
         xi_global = _conv_same(xi, b_xi_global)
@@ -1004,6 +1007,8 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
         else:
             m_P_local = float(np.mean(P_local))
 
+        tonal_mask = np.zeros(M21, dtype=np.float32)
+
         if m_P_local < 0.25:
             P_local[k2_local:k3_local] = P_min
 
@@ -1014,7 +1019,9 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
             )
             tonal_idx = np.where(lhs > rhs)[0] + 6
             tonal_idx = tonal_idx[(tonal_idx >= 0) & (tonal_idx < M21)]
-            P_local[tonal_idx] = P_min
+            if tonal_idx.size > 0:
+                P_local[tonal_idx] = P_min
+                tonal_mask[tonal_idx] = 1.0
 
         if xi_frame_dB <= xi_fl_dB:
             P_frame = P_min
@@ -1050,7 +1057,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
             * np.exp(-v[idx])
         )
 
-        # 7. Spectral gain
+        # ===== Spectral gains =====
         GH1 = np.ones(M21, dtype=np.float32)
         idx_hi = v > 5.0
         GH1[idx_hi] = eta[idx_hi] / (1.0 + eta[idx_hi])
@@ -1081,24 +1088,31 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
         G = (GH1 ** PH1) * (GH0 ** (1.0 - PH1))
         eta_2term = (GH1 ** 2) * gamma
 
-        # ===== Gate score: PH1-weighted residual, no target matching =====
-        #
-        # Use Cohen's PH1 as a soft speech-likelihood mask, but keep
-        # the final proxy close to Wiener-style residual logic.
+        # ===== op3 score =====
+        # harder / less certain frames get larger weight
+        frame_weight = 1.0 + FRAME_BOOST * (1.0 - float(P_frame))
 
         target_floor = np.maximum(lambda_d, EPS)
 
-        # Residual-like energy inside likely-speech bins:
-        # power that still looks noise-floor-like
+        # op2 core terms
         speech_resid = np.sum(PH1 * np.minimum(X2, target_floor))
-
-        # Bad leftover energy in unlikely-speech bins
         noise_excess = np.sum((1.0 - PH1) * X2)
-
-        # Preserved candidate energy in likely-speech bins
         speech_keep = np.sum(PH1 * X2)
 
-        score_num += float(0.7 * speech_resid + 1.0 * noise_excess)
+        # mild speech-hole term: only where speech is likely and GH1 is strong
+        speech_hole = np.sum(PH1 * GH1 * np.maximum(target_floor - X2, 0.0))
+
+        # explicit tonal leftover penalty
+        tonal_penalty = np.sum(tonal_mask * np.maximum(X2 - GH0 * target_floor, 0.0))
+
+        frame_num = (
+            W_SPEECH_RESID * speech_resid
+            + W_NOISE_EXCESS * noise_excess
+            + W_SPEECH_HOLE * speech_hole
+            + W_TONAL * tonal_penalty
+        )
+
+        score_num += float(frame_weight * frame_num)
         score_den += float(speech_keep + EPS)
 
     score = score_num / (score_den + EPS)
