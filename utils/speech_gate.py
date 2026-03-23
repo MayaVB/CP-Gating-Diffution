@@ -721,33 +721,34 @@ def _wiener_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
 
 
 def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
-    """Israel Cohen OM-LSA (from matlab) / IMCRA-inspired gate score. Lower = better.
+    """Cohen-style OM-LSA / IMCRA-inspired gate score. Lower = better.
 
     This is a post-hoc scalar score for adaptive-K gating, not a full enhancer.
-    It follows the structure of Israel Cohen's MATLAB OM-LSA code more closely:
+
+    It follows the structure of Israel Cohen's MATLAB OM-LSA code:
       - STFT with M=512 and 75% overlap
-      - frequency smoothing (w=1)
+      - frequency smoothing
       - smoothed spectra S, St
-      - local minima tracking with Nwin=8, Vwin=15
+      - local minima tracking
       - IMCRA-style noise recursion
       - xi_local / xi_global / xi_frame decisions
       - q -> PH1 -> GH1 / GH0 -> G
 
-    Then, instead of synthesizing an output, it scores x_hat:
-      - penalize energy left in bins where PH1 is low
-      - reward energy preserved in bins where PH1 is high
-      - add a small mismatch penalty to the OM-LSA target power G^2 |Y|^2
+    Final score:
+      - use PH1 as a soft speech-likelihood mask
+      - keep the proxy close to Wiener-style residual logic
+      - do NOT force x_hat to match the OM-LSA target directly
 
-    Lower score means "more compatible with the OM-LSA speech-presence / gain model".
+    Lower score means better candidate.
     """
     import numpy as np
     import librosa
-    from scipy.special import exp1  # MATLAB expint(v) == scipy.special.exp1(v)
+    from scipy.special import exp1
 
     EPS = 1e-10
     MAX_SCORE = 1e6
 
-    # ===== Parameters copied from Cohen's MATLAB code =====
+    # ===== Parameters from Cohen-style OM-LSA / IMCRA =====
     Fs_ref = 16000.0
     M_ref = 512
     Mo_ref = int(0.75 * M_ref)
@@ -794,8 +795,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     y = np.asarray(y[:T], dtype=np.float32)
     x_hat = np.asarray(x_hat[:T], dtype=np.float32)
 
-    # Repo is VoiceBank-style 16 kHz; use the reference settings directly.
-    Fs = 16000.0
+    Fs = Fs_ref
     M = M_ref
     Mo = Mo_ref
     Mno = M - Mo  # hop = 128
@@ -807,8 +807,6 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     eta_min = 10.0 ** (eta_min_dB / 10.0)
     G_f = eta_min ** 0.5
 
-    # MATLAB code normalizes the Hamming window for overlap-add.
-    # For scoring, using a standard Hamming window is enough and keeps us close.
     win = np.hamming(M).astype(np.float32)
 
     Y = librosa.stft(
@@ -838,7 +836,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     b_xi_global = np.hanning(2 * w_xi_global + 1).astype(np.float32)
     b_xi_global /= np.sum(b_xi_global)
 
-    # ===== Frequency ranges from MATLAB =====
+    # ===== Frequency ranges =====
     k_u = int(round(f_u / Fs * M + 1))
     k_l = int(round(f_l / Fs * M + 1))
     k_u = min(k_u, M21)
@@ -849,7 +847,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     k2_local = max(1, min(k2_local, M21 - 1))
     k3_local = max(k2_local + 1, min(k3_local, M21 - 1))
 
-    # ===== Internal helpers =====
+    # ===== Helpers =====
     def _conv_same(x: np.ndarray, h: np.ndarray) -> np.ndarray:
         return np.convolve(x, h, mode="same")
 
@@ -866,7 +864,6 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     xi_frame = 0.0
     l_mod_lswitch = 0
 
-    # These will be initialized on first frame
     lambda_d = np.maximum(PY[:, 0].copy(), EPS)
     Sy = PY[:, 0].copy()
     Sf0 = _conv_same(PY[:, 0], b)
@@ -909,7 +906,6 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
             Sy = Ya2.copy()
         else:
             S = alpha_s * S + (1.0 - alpha_s) * Sf
-
             if l < 14:
                 Smin = S.copy()
                 SMact = S.copy()
@@ -917,7 +913,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
                 Smin = np.minimum(Smin, S)
                 SMact = np.minimum(SMact, S)
 
-        # Local minima search
+        # IMCRA local minima logic
         I_f = ((Ya2 < delta_y * Bmin * Smin) & (S < delta_s * Bmin * Smin)).astype(np.float32)
         conv_I = _conv_same(I_f, b)
         Sft = St.copy()
@@ -983,8 +979,9 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
             lambda_d = 2.0 * lambda_dav
         else:
             lambda_d = 1.4685 * lambda_dav
+        lambda_d = np.maximum(lambda_d, EPS)
 
-        # 4. A priori probability for signal-absence estimate
+        # 4. A priori probability of signal absence
         xi = alpha_xi * xi + (1.0 - alpha_xi) * eta
         xi_local = _conv_same(xi, b_xi_local)
         xi_global = _conv_same(xi, b_xi_global)
@@ -1015,8 +1012,7 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
             rhs = 2.5 * (
                 lambda_dav_long[9:(M21 - 6)] + lambda_dav_long[5:(M21 - 10)]
             )
-            tonal_idx = np.where(lhs > rhs)[0]
-            tonal_idx = tonal_idx + 6
+            tonal_idx = np.where(lhs > rhs)[0] + 6
             tonal_idx = tonal_idx[(tonal_idx >= 0) & (tonal_idx < M21)]
             P_local[tonal_idx] = P_min
 
@@ -1030,7 +1026,9 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
         elif xi_frame_dB <= xi_m_dB + xi_fl_dB:
             P_frame = P_min
         else:
-            P_frame = P_min + (xi_frame_dB - xi_m_dB - xi_fl_dB) / (xi_fu_dB - xi_fl_dB) * (1.0 - P_min)
+            P_frame = P_min + (
+                (xi_frame_dB - xi_m_dB - xi_fl_dB) / (xi_fu_dB - xi_fl_dB)
+            ) * (1.0 - P_min)
 
         if broad_flag:
             q = 1.0 - P_global * P_local * P_frame
@@ -1083,22 +1081,24 @@ def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
         G = (GH1 ** PH1) * (GH0 ** (1.0 - PH1))
         eta_2term = (GH1 ** 2) * gamma
 
-        # ===== Gate score =====
+        # ===== Gate score: PH1-weighted residual, no target matching =====
         #
-        # Closer to the MATLAB logic:
-        # - PH1 says where speech is likely
-        # - G^2 |Y|^2 is the OM-LSA target power
-        #
-        # Penalize x_hat energy where PH1 is low.
-        # Also penalize mismatch to the OM-LSA target in likely-speech bins.
-        target_pow = (G ** 2) * Ya2
+        # Use Cohen's PH1 as a soft speech-likelihood mask, but keep
+        # the final proxy close to Wiener-style residual logic.
 
-        resid_low_ph1 = np.sum((1.0 - PH1) * X2)
+        target_floor = np.maximum(lambda_d, EPS)
+
+        # Residual-like energy inside likely-speech bins:
+        # power that still looks noise-floor-like
+        speech_resid = np.sum(PH1 * np.minimum(X2, target_floor))
+
+        # Bad leftover energy in unlikely-speech bins
+        noise_excess = np.sum((1.0 - PH1) * X2)
+
+        # Preserved candidate energy in likely-speech bins
         speech_keep = np.sum(PH1 * X2)
-        speech_mismatch = np.sum(PH1 * np.abs(X2 - target_pow))
 
-        # small mismatch term so score is not only a binary speech/noise split
-        score_num += float(resid_low_ph1 + 0.10 * speech_mismatch)
+        score_num += float(0.7 * speech_resid + 1.0 * noise_excess)
         score_den += float(speech_keep + EPS)
 
     score = score_num / (score_den + EPS)
