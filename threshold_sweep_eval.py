@@ -50,7 +50,7 @@ import soundfile as sf
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from utils.speech_gate import compute_speech_gate_score
+from utils.speech_gate import compute_speech_gate_score, _omlsa_residual_score
 from utils.dnsmos_helper import to_16k
 from utils.nisqa_helper import compute_nisqa, is_available as nisqa_available
 
@@ -86,11 +86,12 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-ALL_SCORE_METHODS = ["leakage", "stft_leakage", "wiener_residual", "nisqa"]
+ALL_SCORE_METHODS = ["leakage", "stft_leakage", "wiener_residual", "omlsa_residual", "nisqa"]
 HIGHER_IS_BETTER  = {
     "leakage":          False,
     "stft_leakage":     False,
     "wiener_residual":  False,
+    "omlsa_residual":   False,
     "nisqa":            True,
 }
 
@@ -204,6 +205,8 @@ def _compute_all_scores(
                 out[m] = _stft_leakage_score(y, x_hat)
             elif m == "wiener_residual":
                 out[m] = _wiener_residual_score(y, x_hat)
+            elif m == "omlsa_residual":
+                out[m] = _omlsa_residual_score(y, x_hat)
             elif m == "nisqa":
                 out[m] = _nisqa_score(x_hat, sr)
         except Exception as exc:
