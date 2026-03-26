@@ -310,6 +310,78 @@ def _run_adaptive_k_sampling(
     return x_hats[chosen_try], adaptive_kmax, chosen_try, d0, best_score, True
 
 
+def _run_adaptive_k_multilevel_sampling(
+    build_sampler,
+    k_levels,
+    tau_levels,
+    base_seed,
+    model,
+    T_orig,
+    norm_factor,
+    y_np,
+    adaptive_score="wiener_residual",
+):
+    """Multi-level adaptive-K policy: maps d0 to K in k_levels via tau_levels.
+
+    Algorithm
+    ---------
+    1. Generate try 0, compute d0.
+    2. Choose K_target:
+         d0 <= tau_levels[0]                     → k_levels[0]  (= 1)
+         tau_levels[i-1] < d0 <= tau_levels[i]   → k_levels[i]
+         d0 > tau_levels[-1]                     → k_levels[-1]
+    3. If K_target == 1: return try_0 immediately.
+    4. Else: generate tries 1..K_target-1, return argmin-score try.
+
+    Parameters
+    ----------
+    k_levels    : sorted list[int], first element must be 1
+    tau_levels  : sorted list[float], length == len(k_levels) - 1
+    """
+    if adaptive_score == "wiener_residual":
+        from utils.speech_gate import _wiener_residual_score as _score_fn
+    elif adaptive_score == "omlsa_residual":
+        from utils.speech_gate import _omlsa_residual_score as _score_fn
+    else:
+        raise ValueError(f"Unknown adaptive_score: {adaptive_score!r}")
+
+    def _score(x_hat_tensor):
+        v = _score_fn(y_np, (x_hat_tensor / norm_factor).cpu().numpy())
+        return v if (v == v and abs(v) != float("inf")) else float("inf")
+
+    # --- Try 0 ---
+    if base_seed is not None:
+        _set_seeds(base_seed + 0)
+    sample_0, _ = build_sampler()()
+    x_hat_0 = model.to_audio(sample_0.squeeze(), T_orig) * norm_factor
+    d0 = _score(x_hat_0)
+
+    # --- Choose K_target from d0 ---
+    k_target = k_levels[-1]
+    for tau, k in zip(tau_levels, k_levels):
+        if d0 <= tau:
+            k_target = k
+            break
+
+    if k_target == 1:
+        return x_hat_0, 1, 0, d0, d0, False
+
+    # --- Generate tries 1..k_target-1, select argmin ---
+    scores = [d0]
+    x_hats = [x_hat_0]
+    for k in range(1, k_target):
+        if base_seed is not None:
+            _set_seeds(base_seed + k)
+        s_k, _ = build_sampler()()
+        x_k = model.to_audio(s_k.squeeze(), T_orig) * norm_factor
+        scores.append(_score(x_k))
+        x_hats.append(x_k)
+
+    chosen_try = int(np.argmin(scores))
+    best_score = float(scores[chosen_try])
+    return x_hats[chosen_try], k_target, chosen_try, d0, best_score, True
+
+
 def _run_mid_wiener_sampling(
     build_sampler,
     mid_wiener_step,
@@ -410,9 +482,10 @@ if __name__ == '__main__':
     parser.add_argument("--save_steps_dir_prefix", type=str, default="step", help="Directory prefix for step snapshots; outputs to {enhanced_dir}/{prefix}_{k:03d}/")
     parser.add_argument("--save_steps_limit", type=int, default=0, help="If >0, save step snapshots only for first N utterances (0 = no limit; use with --save_steps_all)")
     # --- Adaptive-K policy args ---
-    parser.add_argument("--policy", choices=["legacy", "adaptive_k"], default="legacy",
+    parser.add_argument("--policy", choices=["legacy", "adaptive_k", "adaptive_k_multilevel"], default="legacy",
                         help="Inference policy: 'legacy' = existing per-step gate/restart (default); "
-                             "'adaptive_k' = reference-free difficulty-based K escalation")
+                             "'adaptive_k' = binary difficulty-based K escalation; "
+                             "'adaptive_k_multilevel' = multi-level difficulty-based K escalation")
     parser.add_argument("--adaptive_score", choices=["wiener_residual", "omlsa_residual"], default="wiener_residual",
                         help="Post-hoc score used for adaptive-K difficulty and selection (default: wiener_residual)")
     parser.add_argument("--adaptive_tau", type=float, default=None,
@@ -420,6 +493,12 @@ if __name__ == '__main__':
                              "Required when --policy adaptive_k.")
     parser.add_argument("--adaptive_kmax", type=int, default=10,
                         help="Max number of tries for adaptive_k escalation (default: 10)")
+    parser.add_argument("--adaptive_k_levels", type=str, default="1,3,5,10",
+                        help="Comma-separated ascending K levels for adaptive_k_multilevel (default: '1,3,5,10')")
+    parser.add_argument("--adaptive_tau_levels", type=str, default=None,
+                        help="Comma-separated ascending thresholds for adaptive_k_multilevel. "
+                             "Must have length len(k_levels)-1. Example for K=[1,3,5,10]: 'tau1,tau2,tau3' where "
+                             "d0<=tau1→K=1, tau1<d0<=tau2→K=3, tau2<d0<=tau3→K=5, d0>tau3→K=10")
     # --- Mid-step Wiener gating args ---
     parser.add_argument("--mid_wiener_enable", action="store_true",
                         help="Enable mid-step Wiener gating policy (mutually exclusive with --policy adaptive_k)")
@@ -435,6 +514,30 @@ if __name__ == '__main__':
     if args.policy == "adaptive_k" and args.adaptive_tau is None:
         raise ValueError("--adaptive_tau is required when --policy adaptive_k")
 
+    if args.policy == "adaptive_k_multilevel":
+        if args.adaptive_tau_levels is None:
+            raise ValueError("--adaptive_tau_levels is required when --policy adaptive_k_multilevel")
+        try:
+            _k_levels = [int(x) for x in args.adaptive_k_levels.split(",")]
+        except ValueError:
+            raise ValueError(f"--adaptive_k_levels must be comma-separated ints, got: {args.adaptive_k_levels!r}")
+        try:
+            _tau_levels = [float(x) for x in args.adaptive_tau_levels.split(",")]
+        except ValueError:
+            raise ValueError(f"--adaptive_tau_levels must be comma-separated floats, got: {args.adaptive_tau_levels!r}")
+        if _k_levels != sorted(set(_k_levels)):
+            raise ValueError(f"--adaptive_k_levels must be strictly ascending distinct ints, got: {_k_levels}")
+        if _tau_levels != sorted(_tau_levels):
+            raise ValueError(f"--adaptive_tau_levels must be ascending, got: {_tau_levels}")
+        if _k_levels[0] != 1:
+            raise ValueError(f"First K level must be 1, got: {_k_levels[0]}")
+        if len(_tau_levels) != len(_k_levels) - 1:
+            raise ValueError(
+                f"len(tau_levels)={len(_tau_levels)} must equal len(k_levels)-1={len(_k_levels)-1}"
+            )
+        args._k_levels   = _k_levels
+        args._tau_levels = _tau_levels
+
     if args.mid_wiener_enable:
         if args.mid_wiener_step is None:
             raise ValueError("--mid_wiener_step is required when --mid_wiener_enable")
@@ -442,7 +545,7 @@ if __name__ == '__main__':
             raise ValueError("--mid_wiener_enable and --policy adaptive_k are mutually exclusive")
 
     # --- Adaptive-K: warn once about legacy-only args that are active but will be ignored ---
-    if args.policy == "adaptive_k":
+    if args.policy in ("adaptive_k", "adaptive_k_multilevel"):
         _legacy_active = []
         if args.gate_tau_path is not None:
             _legacy_active.append("gate_tau_path")
@@ -465,7 +568,7 @@ if __name__ == '__main__':
         if args.gate_debug_file:
             _legacy_active.append("gate_debug_file")
         if _legacy_active:
-            print(f"[adaptive_k] Ignoring legacy gating args: {', '.join(_legacy_active)}")
+            print(f"[{args.policy}] Ignoring legacy gating args: {', '.join(_legacy_active)}")
 
     # Research output directories (rooted under enhanced_dir)
     _rd_calib = join(args.enhanced_dir, "calib")
@@ -580,8 +683,8 @@ if __name__ == '__main__':
         print(f"[DEBUG_GATE_SAVE] gate_compute_tau = {args.gate_compute_tau}")
         print(f"[DEBUG_GATE_SAVE] WAV save condition (not gate_compute_tau) = {not args.gate_compute_tau}")
 
-    # Per-utterance log for adaptive_k mode (None in legacy mode so accidental use raises early)
-    _ak_log = [] if args.policy == "adaptive_k" else None
+    # Per-utterance log for adaptive_k / adaptive_k_multilevel mode
+    _ak_log = [] if args.policy in ("adaptive_k", "adaptive_k_multilevel") else None
     # Per-utterance log for mid_wiener mode
     _mw_log = [] if args.mid_wiener_enable else None
 
@@ -734,6 +837,48 @@ if __name__ == '__main__':
                 "chosen_k":       _ak_chosen_k,
                 "chosen_try":     _ak_chosen_try,
                 "best_score":     round(float(_ak_best_score), 6),
+            })
+            makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
+            write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
+            _save_steps_utt_idx[0] += 1
+            continue
+
+        if args.policy == "adaptive_k_multilevel":
+            y_np = y.squeeze().cpu().numpy()
+            _ak_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
+            (x_hat,
+             _ak_chosen_k,
+             _ak_chosen_try,
+             _ak_d0,
+             _ak_best_score,
+             _ak_escalated) = _run_adaptive_k_multilevel_sampling(
+                build_sampler=_build_sampler,
+                k_levels=args._k_levels,
+                tau_levels=args._tau_levels,
+                base_seed=_ak_base_seed,
+                model=model,
+                T_orig=T_orig,
+                norm_factor=norm_factor,
+                y_np=y_np,
+                adaptive_score=args.adaptive_score,
+            )
+            print(f"[adaptive_k_multilevel] file={filename}  utt_idx={_utt_idx}  "
+                  f"base_seed={_ak_base_seed}  d0={_ak_d0:.4f}  "
+                  f"escalated={_ak_escalated}  chosen_k={_ak_chosen_k}  "
+                  f"chosen_try={_ak_chosen_try}  best_score={_ak_best_score:.4f}")
+            _ak_log.append({
+                "utterance_idx":     _utt_idx,
+                "filename":          filename,
+                "base_seed_used":    _ak_base_seed,
+                "adaptive_score":    args.adaptive_score,
+                "policy":            "adaptive_k_multilevel",
+                "target_k_levels":   args.adaptive_k_levels,
+                "target_tau_levels": args.adaptive_tau_levels,
+                "d0":                round(float(_ak_d0), 6),
+                "escalated":         int(_ak_escalated),
+                "chosen_k":          _ak_chosen_k,
+                "chosen_try":        _ak_chosen_try,
+                "best_score":        round(float(_ak_best_score), 6),
             })
             makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
             write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
@@ -1073,11 +1218,16 @@ if __name__ == '__main__':
         print(f"p99:   {percentiles[4]:.4f}")
         print("Scores saved to speech_gate_scores.npy")
 
-    if args.policy == "adaptive_k" and _ak_log:
+    if args.policy in ("adaptive_k", "adaptive_k_multilevel") and _ak_log:
         _ak_csv_path = join(args.enhanced_dir, "adaptive_k_log.csv")
-        _ak_fields = ["utterance_idx", "filename", "base_seed_used",
-                      "adaptive_score", "adaptive_tau", "adaptive_kmax",
-                      "d0", "escalated", "chosen_k", "chosen_try", "best_score"]
+        if args.policy == "adaptive_k_multilevel":
+            _ak_fields = ["utterance_idx", "filename", "base_seed_used",
+                          "adaptive_score", "policy", "target_k_levels", "target_tau_levels",
+                          "d0", "escalated", "chosen_k", "chosen_try", "best_score"]
+        else:
+            _ak_fields = ["utterance_idx", "filename", "base_seed_used",
+                          "adaptive_score", "adaptive_tau", "adaptive_kmax",
+                          "d0", "escalated", "chosen_k", "chosen_try", "best_score"]
         with open(_ak_csv_path, "w", newline="") as _f:
             _writer = csv.DictWriter(_f, fieldnames=_ak_fields)
             _writer.writeheader()
