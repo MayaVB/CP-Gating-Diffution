@@ -167,6 +167,28 @@ def gate_step_wiener_residual(step_info: dict, cache: dict) -> float:
     return min(score, 1e6)
 
 
+def gate_step_omlsa_residual(step_info: dict, cache: dict) -> float:
+    """Mid-step OMLSA-residual gate.
+
+    Converts the intermediate latent estimate to time-domain audio, then
+    applies _omlsa_residual_score(y_np, x_hat_mid_np).  Lower = better.
+
+    cache keys required:
+        model       : ScoreModel — to call model.to_audio
+        T_orig      : int        — original waveform length
+        norm_factor : float      — amplitude normalisation factor
+        y_np        : np.ndarray [T] — normalised noisy input waveform
+    """
+    xt_mean     = step_info["xt_mean"]
+    model       = cache["model"]
+    T_orig      = cache["T_orig"]
+    norm_factor = cache["norm_factor"]
+    y_np        = cache["y_np"]
+
+    x_hat_mid = model.to_audio(xt_mean.squeeze(), T_orig) * norm_factor
+    return _omlsa_residual_score(y_np, x_hat_mid.cpu().numpy())
+
+
 def gate_step_stft_leakage(step_info: dict, cache: dict) -> float:
     """Per-step non-speech/speech frame-power ratio on the TF spectrogram.
 

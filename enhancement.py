@@ -391,63 +391,103 @@ def _run_mid_wiener_sampling(
     model,
     T_orig,
     norm_factor,
+    mid_wiener_tau=None,
+    mid_wiener_score="wiener_residual",
+    mid_omlsa_k_levels=None,
+    mid_omlsa_tau_levels=None,
 ):
-    """Mid-step Wiener score-logging with multi-try selection (pure logging mode).
+    """Mid-step score-logging with adaptive multi-try selection.
 
-    Runs ALL mid_wiener_kmax tries to completion — no aborting, no running-max,
-    no tau threshold during inference.  At step_idx == mid_wiener_step a single
-    Wiener-residual score is recorded from the intermediate latent estimate.
-    The try with the lowest mid-step score is returned (argmin selection).
-    Tau-based gating is applied offline via sweep_mid_wiener_tau.py.
+    Always runs try 0 first and records its mid-step score (d0).
+    K-selection policy (in priority order):
+      1. Multi-level  (mid_omlsa_k_levels + mid_omlsa_tau_levels set):
+           d0 mapped to k_target via tau_levels; runs tries 0..k_target-1.
+      2. Binary tau   (mid_wiener_tau set, no k_levels):
+           d0 <= tau → effective_k=1; else run all mid_wiener_kmax tries.
+      3. Offline mode (neither set):
+           all mid_wiener_kmax tries always run (for offline tau sweep).
+
+    Scoring function selected by mid_wiener_score:
+      "wiener_residual" — mid-step latent spectrogram Wiener residual (default)
+      "omlsa_residual"  — convert latent to audio at mid-step, apply OMLSA score;
+                          requires gate_cache to contain model/T_orig/norm_factor/y_np
 
     Parameters
     ----------
-    build_sampler     : callable(step_callback=None) → sampler
-    mid_wiener_step   : int   — diffusion step index at which to score
-    mid_wiener_kmax   : int   — total number of tries (all run to completion)
-    base_seed         : int or None — try j uses base_seed+j; None = no seeding
-    gate_cache        : dict  — must contain 'speech_mask_frames' and 'eps'
-    model             : ScoreModel
-    T_orig            : int   — original waveform length (for model.to_audio)
-    norm_factor       : float — amplitude normalisation factor
+    build_sampler          : callable(step_callback=None) → sampler
+    mid_wiener_step        : int         — diffusion step index at which to score
+    mid_wiener_kmax        : int         — max tries when escalating (binary/offline modes)
+    base_seed              : int or None — try j uses base_seed+j; None = no seeding
+    gate_cache             : dict        — scoring cache (see mid_wiener_score above)
+    model                  : ScoreModel
+    T_orig                 : int         — original waveform length (for model.to_audio)
+    norm_factor            : float       — amplitude normalisation factor
+    mid_wiener_tau         : float|None  — binary gating threshold
+    mid_wiener_score       : str         — "wiener_residual" or "omlsa_residual"
+    mid_omlsa_k_levels    : list[int]|None  — ascending K levels, first must be 1
+    mid_omlsa_tau_levels  : list[float]|None — len == len(k_levels)-1
 
     Returns
     -------
-    x_hat_best    : enhanced waveform of the argmin-score try, scaled by norm_factor
-    scores        : list[float] — mid-step Wiener score for each try
-    chosen_try    : int         — 0-based index of the argmin-score try
-    effective_k   : int         — mid_wiener_kmax (all tries were run)
+    x_hat_best  : enhanced waveform of the chosen try, scaled by norm_factor
+    scores      : list[float] — mid-step score for each try actually run
+    chosen_try  : int         — 0-based index of the chosen try
+    effective_k : int         — number of tries actually run
     """
-    from utils.speech_gate import gate_step_wiener_residual
+    if mid_wiener_score == "wiener_residual":
+        from utils.speech_gate import gate_step_wiener_residual as _gate_fn
+    elif mid_wiener_score == "omlsa_residual":
+        from utils.speech_gate import gate_step_omlsa_residual as _gate_fn
+    else:
+        raise ValueError(f"Unknown mid_wiener_score: {mid_wiener_score!r}")
 
-    scores       = []
-    best_score   = float("inf")
-    best_x_hat   = None
-    chosen_try   = 0
-
-    for _t in range(mid_wiener_kmax):
-        _score_box = [None]   # mutable single-element container; mutated by callback
+    def _run_try(t):
+        """Run one diffusion try, return (x_hat, score)."""
+        _score_box = [None]
 
         def _step_cb(_si, _sb=_score_box, _cache=gate_cache, _target=mid_wiener_step):
             if _si["step_idx"] == _target:
-                _sb[0] = gate_step_wiener_residual(_si, _cache)
+                _sb[0] = _gate_fn(_si, _cache)
 
         if base_seed is not None:
-            _set_seeds(base_seed + _t)
-
+            _set_seeds(base_seed + t)
         sample, _ = build_sampler(step_callback=_step_cb)()
         x_hat_t = model.to_audio(sample.squeeze(), T_orig) * norm_factor
+        score = _score_box[0] if _score_box[0] is not None else float("inf")
+        return x_hat_t, score
 
-        # Sentinel for edge case where target step was never reached (step >= N)
-        _score = _score_box[0] if _score_box[0] is not None else float("inf")
-        scores.append(_score)
+    # --- Try 0 (always run first) ---
+    x_hat_0, d0 = _run_try(0)
+    scores     = [d0]
+    best_score = d0
+    best_x_hat = x_hat_0
+    chosen_try = 0
 
-        if _score < best_score:
-            best_score = _score
+    # --- Determine k_target ---
+    if mid_omlsa_k_levels is not None:
+        # Multi-level policy
+        k_target = mid_omlsa_k_levels[-1]
+        for tau, k in zip(mid_omlsa_tau_levels, mid_omlsa_k_levels):
+            if d0 <= tau:
+                k_target = k
+                break
+    elif mid_wiener_tau is not None:
+        # Binary gating
+        k_target = 1 if d0 <= mid_wiener_tau else mid_wiener_kmax
+    else:
+        # Offline mode: always run all tries
+        k_target = mid_wiener_kmax
+
+    # --- Run tries 1..k_target-1 ---
+    for _t in range(1, k_target):
+        x_hat_t, score = _run_try(_t)
+        scores.append(score)
+        if score < best_score:
+            best_score = score
             best_x_hat = x_hat_t
             chosen_try = _t
 
-    return best_x_hat, scores, chosen_try, mid_wiener_kmax
+    return best_x_hat, scores, chosen_try, k_target
 
 
 if __name__ == '__main__':
@@ -505,10 +545,21 @@ if __name__ == '__main__':
     parser.add_argument("--mid_wiener_step", type=int, default=None,
                         help="Diffusion step index at which to score each try; required with --mid_wiener_enable")
     parser.add_argument("--mid_wiener_tau", type=float, default=None,
-                        help="Unused during inference (tau is swept offline by sweep_mid_wiener_tau.py); "
-                             "stored as metadata in mid_wiener_log.csv if provided")
+                        help="Binary gating threshold: skip escalation when d0 <= tau (effective_k=1). "
+                             "Ignored if --mid_omlsa_k_levels is set. "
+                             "If neither is set, all mid_wiener_kmax tries are run for every file (offline sweep mode).")
     parser.add_argument("--mid_wiener_kmax", type=int, default=10,
                         help="Maximum number of tries for mid-step Wiener gating (default: 10)")
+    parser.add_argument("--mid_wiener_score", choices=["wiener_residual", "omlsa_residual"],
+                        default="wiener_residual",
+                        help="Mid-step scoring function: 'wiener_residual' (default) uses the latent spectrogram; "
+                             "'omlsa_residual' converts latent to audio and applies OMLSA scoring.")
+    parser.add_argument("--mid_omlsa_k_levels", type=str, default=None,
+                        help="Multi-level K policy: comma-separated ascending ints, first must be 1. "
+                             "E.g. '1,3,5,10'. Requires --mid_omlsa_tau_levels.")
+    parser.add_argument("--mid_omlsa_tau_levels", type=str, default=None,
+                        help="Comma-separated ascending thresholds for multi-level mid-step gating. "
+                             "Length must be len(k_levels)-1. E.g. 'tau1,tau2,tau3' for k_levels=1,3,5,10.")
     args = parser.parse_args()
 
     if args.policy == "adaptive_k" and args.adaptive_tau is None:
@@ -543,6 +594,32 @@ if __name__ == '__main__':
             raise ValueError("--mid_wiener_step is required when --mid_wiener_enable")
         if args.policy == "adaptive_k":
             raise ValueError("--mid_wiener_enable and --policy adaptive_k are mutually exclusive")
+        if args.mid_omlsa_k_levels is not None:
+            if args.mid_omlsa_tau_levels is None:
+                raise ValueError("--mid_omlsa_tau_levels is required when --mid_omlsa_k_levels is set")
+            try:
+                _mw_k_levels = [int(x) for x in args.mid_omlsa_k_levels.split(",")]
+            except ValueError:
+                raise ValueError(f"--mid_omlsa_k_levels must be comma-separated ints, got: {args.mid_omlsa_k_levels!r}")
+            try:
+                _mw_tau_levels = [float(x) for x in args.mid_omlsa_tau_levels.split(",")]
+            except ValueError:
+                raise ValueError(f"--mid_omlsa_tau_levels must be comma-separated floats, got: {args.mid_omlsa_tau_levels!r}")
+            if _mw_k_levels[0] != 1:
+                raise ValueError(f"First mid_omlsa_k_levels value must be 1, got: {_mw_k_levels[0]}")
+            if _mw_k_levels != sorted(set(_mw_k_levels)):
+                raise ValueError(f"--mid_omlsa_k_levels must be strictly ascending, got: {_mw_k_levels}")
+            if _mw_tau_levels != sorted(_mw_tau_levels):
+                raise ValueError(f"--mid_omlsa_tau_levels must be ascending, got: {_mw_tau_levels}")
+            if len(_mw_tau_levels) != len(_mw_k_levels) - 1:
+                raise ValueError(
+                    f"len(tau_levels)={len(_mw_tau_levels)} must equal len(k_levels)-1={len(_mw_k_levels)-1}"
+                )
+            args._mw_omlsa_k_levels   = _mw_k_levels
+            args._mw_omlsa_tau_levels = _mw_tau_levels
+        else:
+            args._mw_omlsa_k_levels   = None
+            args._mw_omlsa_tau_levels = None
 
     # --- Adaptive-K: warn once about legacy-only args that are active but will be ignored ---
     if args.policy in ("adaptive_k", "adaptive_k_multilevel"):
@@ -760,6 +837,11 @@ if __name__ == '__main__':
                 "speech_mask_frames": _yf_power > np.percentile(_yf_power, 80),
                 "eps": 1e-8,
             }
+            if args.mid_wiener_score == "omlsa_residual":
+                _mw_cache["model"]       = model
+                _mw_cache["T_orig"]      = T_orig
+                _mw_cache["norm_factor"] = norm_factor
+                _mw_cache["y_np"]        = y.squeeze().cpu().numpy()
             _mw_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
             (x_hat,
              _mw_scores,
@@ -773,6 +855,10 @@ if __name__ == '__main__':
                 model=model,
                 T_orig=T_orig,
                 norm_factor=norm_factor,
+                mid_wiener_tau=args.mid_wiener_tau,
+                mid_wiener_score=args.mid_wiener_score,
+                mid_omlsa_k_levels=args._mw_omlsa_k_levels,
+                mid_omlsa_tau_levels=args._mw_omlsa_tau_levels,
             )
             _mw_score_try0   = _mw_scores[0]
             _mw_chosen_score = _mw_scores[_mw_chosen_try]
