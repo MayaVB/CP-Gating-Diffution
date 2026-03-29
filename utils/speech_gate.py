@@ -189,6 +189,250 @@ def gate_step_omlsa_residual(step_info: dict, cache: dict) -> float:
     return _omlsa_residual_score(y_np, x_hat_mid.cpu().numpy())
 
 
+def _omlsa_residual_tf_score(S: np.ndarray, eps: float = 1e-10) -> float:
+    """OM-LSA-inspired TF-domain gate (op4). Lower = better.
+
+    Operates directly on the power spectrogram S [F, T_frames].
+    No waveform conversion, no external VAD mask, no scipy dependency.
+
+    Improvements over v1:
+      - P_frame uses xi_m_dB running level + relative thresholds (Cohen 2002 eq.12)
+      - Frame-confidence weighting: harder frames (low P_frame) count more
+      - Richer score: speech_resid + noise_excess with separate weights
+      - Dual-timescale noise tracker: short lambda_d + slow lambda_d_long
+      - Simplified tonal penalty from local peaks in lambda_d_long
+
+    Still simplified relative to _omlsa_residual_score:
+      - No GH1 spectral gain (avoids scipy.special.exp1)
+      - No speech_hole term (requires X2 vs PY distinction)
+      - Tonal detection uses enhanced PSD rather than noisy PSD
+    """
+    MAX_SCORE = 1e6
+    F, T = S.shape
+    if T < 4:
+        return 0.0
+
+    # --- params (Cohen 2002 defaults) ---
+    alpha_s      = 0.9
+    alpha_eta    = 0.95
+    alpha_xi     = 0.7
+    alpha_d      = 0.85
+    alpha_d_long = 0.99   # NEW: slow tracker for tonal detection
+    q_max        = 0.998
+    P_min        = 0.005
+    eta_min      = 10 ** (-18.0 / 10)
+    Nwin, Vwin   = 8, 15
+
+    # dB thresholds for P_local / P_global
+    xi_ll, xi_lu = -10.0, -5.0
+    xi_gl, xi_gu = -10.0, -5.0
+
+    # NEW: P_frame thresholds — xi_fl/xi_fu are relative to xi_m_dB (Cohen eq.12)
+    xi_fl, xi_fu = -10.0, -5.0   # relative offsets applied to xi_m_dB
+    xi_ml, xi_mu =   0.0, 10.0   # clamp range for xi_m_dB
+
+    # NEW: score weights matching _omlsa_residual_score op3
+    FRAME_BOOST    = 0.75
+    W_SPEECH_RESID = 0.70
+    W_NOISE_EXCESS = 1.00
+    W_TONAL        = 0.35
+
+    # --- helpers ---
+    def _hann_kernel(half_w: int) -> np.ndarray:
+        k = np.hanning(2 * half_w + 1).astype(np.float32)
+        return k / k.sum()
+
+    def _fsmooth(x: np.ndarray, k: np.ndarray) -> np.ndarray:
+        return np.convolve(x, k, mode="same")
+
+    def _db_prob(x_db: np.ndarray, lo: float, hi: float, pmin: float) -> np.ndarray:
+        out = np.ones(len(x_db), dtype=np.float32)
+        out[x_db <= lo] = pmin
+        mid = (x_db > lo) & (x_db < hi)
+        out[mid] = pmin + (x_db[mid] - lo) / (hi - lo) * (1.0 - pmin)
+        return out
+
+    b_freq   = _hann_kernel(1)
+    b_local  = _hann_kernel(1)
+    b_global = _hann_kernel(15)
+
+    # --- initial state ---
+    S0           = np.maximum(S[:, 0], eps)
+    Sf0          = _fsmooth(S0, b_freq)
+    S_smooth     = Sf0.copy()
+    S_min        = S_smooth.copy()
+    S_act        = S_smooth.copy()
+    lambda_d     = S0.copy()
+    lambda_d_long = S0.copy()   # NEW: slow noise PSD for tonal detection
+    eta_prev     = np.zeros(F, np.float32)
+    xi_prev      = np.zeros(F, np.float32)
+    xi_frame     = 0.0
+    xi_m_dB      = 0.0   # NEW: running xi_frame level for relative P_frame thresholds
+
+    SW   = np.tile(S_smooth[:, None], (1, Nwin))
+    l_sw = 0
+
+    score_num = 0.0
+    score_den = 0.0
+
+    for t in range(T):
+        ya2 = np.maximum(S[:, t], eps)
+
+        # 1) frequency smoothing
+        Sf_t = _fsmooth(ya2, b_freq)
+
+        # 2) temporal smoothing
+        if t == 0:
+            S_smooth = Sf_t.copy()
+        else:
+            S_smooth = alpha_s * S_smooth + (1.0 - alpha_s) * Sf_t
+
+        # 3) IMCRA min-stats
+        if t < 14:
+            S_min = S_smooth.copy()
+            S_act = S_smooth.copy()
+        else:
+            S_min = np.minimum(S_min, S_smooth)
+            S_act = np.minimum(S_act, S_smooth)
+
+        l_sw += 1
+        if l_sw == Vwin:
+            l_sw = 0
+            SW    = np.concatenate([SW[:, 1:], S_act[:, None]], axis=1)
+            S_min = np.min(SW, axis=1)
+            S_act = S_smooth.copy()
+
+        # 4) posteriori and a priori SNR
+        gamma    = ya2 / np.maximum(lambda_d, eps)
+        eta      = alpha_eta * eta_prev + (1.0 - alpha_eta) * np.maximum(gamma - 1.0, 0.0)
+        eta      = np.maximum(eta, eta_min)
+        v        = gamma * eta / (1.0 + eta)
+        eta_prev = eta
+
+        # 5) speech-presence terms
+        xi        = alpha_xi * xi_prev + (1.0 - alpha_xi) * eta
+        xi_prev   = xi
+        xi_local  = _fsmooth(xi, b_local)
+        xi_global = _fsmooth(xi, b_global)
+
+        xi_frame_new = float(np.mean(xi))
+        dxi          = xi_frame_new - xi_frame
+        xi_frame     = xi_frame_new
+
+        xi_local_dB  = 10.0 * np.log10(np.maximum(xi_local,  1e-10))
+        xi_global_dB = 10.0 * np.log10(np.maximum(xi_global, 1e-10))
+        xi_frame_dB  = 10.0 * np.log10(max(xi_frame, 1e-10))
+
+        P_local  = _db_prob(xi_local_dB,  xi_ll, xi_lu, P_min)
+        P_global = _db_prob(xi_global_dB, xi_gl, xi_gu, P_min)
+
+        # NEW: P_frame with xi_m_dB running level (Cohen 2002 eq.12)
+        # On rising SNR: update xi_m_dB, set P_frame=1.
+        # On falling SNR: use relative thresholds xi_m_dB + xi_fl / xi_m_dB + xi_fu.
+        # This prevents false P_frame=0 when SNR is merely below its own running max.
+        if xi_frame_dB <= xi_fl:
+            P_frame = P_min
+        elif dxi >= 0:
+            xi_m_dB = float(np.clip(xi_frame_dB, xi_ml, xi_mu))  # update running level
+            P_frame = 1.0
+        elif xi_frame_dB >= xi_m_dB + xi_fu:
+            P_frame = 1.0
+        elif xi_frame_dB <= xi_m_dB + xi_fl:
+            P_frame = P_min
+        else:
+            P_frame = float(np.clip(
+                P_min + (xi_frame_dB - xi_m_dB - xi_fl) / (xi_fu - xi_fl) * (1.0 - P_min),
+                P_min, 1.0,
+            ))
+
+        # 6) q → PH1
+        q   = np.minimum(1.0 - P_local * P_global * float(P_frame), q_max)
+        PH1 = np.zeros(F, np.float32)
+        idx = q < 0.9
+        if idx.any():
+            denom    = 1.0 + q[idx] / np.maximum(1.0 - q[idx], eps) * (1.0 + eta[idx]) * np.exp(-v[idx])
+            PH1[idx] = 1.0 / np.maximum(denom, eps)
+
+        # 7) P-weighted noise PSD update
+        alpha_d_t = alpha_d + (1.0 - alpha_d) * PH1
+        lambda_d  = np.maximum(alpha_d_t * lambda_d + (1.0 - alpha_d_t) * ya2, eps)
+
+        # NEW: slow noise tracker for tonal detection (mirrors lambda_dav_long in full score)
+        if t < 14:
+            lambda_d_long = lambda_d.copy()
+        else:
+            alpha_dl_t    = alpha_d_long + (1.0 - alpha_d_long) * PH1
+            lambda_d_long = np.maximum(alpha_dl_t * lambda_d_long + (1.0 - alpha_dl_t) * ya2, eps)
+
+        # NEW: simplified tonal detection — flag bins that are local spectral peaks
+        # in lambda_d_long (±2 bin neighbourhood). Mirrors Cohen tonal logic but on
+        # the enhanced PSD rather than the noisy PSD.
+        tonal_mask = np.zeros(F, np.float32)
+        if t > 120 and F > 16:
+            lhs = lambda_d_long[6:(F - 6)]
+            rhs = 2.5 * (lambda_d_long[8:(F - 4)] + lambda_d_long[4:(F - 8)])
+            tonal_idx = np.where(lhs > rhs)[0] + 6
+            tonal_mask[tonal_idx] = 1.0
+
+        # NEW: frame-confidence weight — uncertain frames (low P_frame) count more,
+        # matching the FRAME_BOOST logic in _omlsa_residual_score.
+        frame_weight = 1.0 + FRAME_BOOST * (1.0 - float(P_frame))
+
+        # NEW: richer score terms matching _omlsa_residual_score op3
+        target_floor = np.maximum(lambda_d, eps)
+
+        # speech_resid: speech-likely bins where power is below noise floor
+        # (under-suppression signal analogous to op3's speech_resid term)
+        speech_resid = float(np.sum(PH1 * np.minimum(ya2, target_floor)))
+
+        # noise_excess: energy in noise-likely bins (op3's noise_excess term)
+        noise_excess = float(np.sum((1.0 - PH1) * ya2))
+
+        # tonal_pen: tonal leftover — bins flagged as peaks above the noise floor
+        tonal_pen = float(np.sum(tonal_mask * np.maximum(ya2 - target_floor, 0.0)))
+
+        # speech_keep: denominator — speech-likely energy
+        speech_keep = float(np.sum(PH1 * ya2))
+
+        frame_num = (
+            W_SPEECH_RESID * speech_resid
+            + W_NOISE_EXCESS * noise_excess
+            + W_TONAL * tonal_pen
+        )
+
+        score_num += float(frame_weight * frame_num)
+        score_den += speech_keep + eps
+
+    score = score_num / (score_den + eps)
+    return min(float(score), MAX_SCORE) if np.isfinite(score) else MAX_SCORE
+
+
+def gate_step_omlsa_residual_tf(step_info: dict, cache: dict) -> float:
+    """Per-step OMLSA-TF gate — pure TF-domain, no waveform conversion.
+
+    Extracts the power spectrogram of xt_mean directly and scores it with
+    _omlsa_residual_tf_score.  Lower = better.
+
+    Does NOT require model / T_orig / norm_factor / y_np in cache.
+
+    step_info keys (used):
+        xt_mean : torch.Tensor [B, C, F, T_spec] — denoised latent estimate
+
+    cache keys (used):
+        eps : float (default 1e-10)
+
+    Returns:
+        float: noise-like-to-speech-like energy ratio (higher = worse).
+               0.0 on edge cases.
+    """
+    xt_mean = step_info["xt_mean"]                               # [B, C, F, T_spec]
+    eps     = cache.get("eps", 1e-10)
+
+    # Sum power over channels → [F, T_spec]; single .cpu() call
+    S = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()  # [F, T_spec]
+    return _omlsa_residual_tf_score(S, eps=eps)
+
+
 def gate_step_stft_leakage(step_info: dict, cache: dict) -> float:
     """Per-step non-speech/speech frame-power ratio on the TF spectrogram.
 
@@ -473,23 +717,29 @@ def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> d
     """Return {gate_name: score} for each requested gate at this diffusion step.
 
     Supported gates:
-        "leakage"          — non-speech-to-speech frame-power ratio (reference-free).
-        "wiener_residual"  — Wiener-like residual-to-speech-excess energy ratio over
-                             speech frames; reference-free SI-SDR proxy.
-                             Higher = more noise leaking through = worse.
-        "stft_leakage"     — Simple non-speech/speech frame-power ratio on the TF
-                             spectrogram (sum over F then mean per region).  Matches
-                             the post-hoc _stft_leakage_score exactly.
-                             Higher = more leakage = worse.
-        "traj_jump"        — Relative squared displacement between consecutive
-                             xt_mean tensors.  Speech-agnostic trajectory instability.
-                             Higher = larger jump = worse.
-        "traj_curvature"   — Normalised squared second difference of consecutive
-                             xt_mean tensors.  Discrete curvature of the trajectory.
-                             Higher = sharper bend = worse.
-        "pred_jump"        — Relative squared displacement between consecutive
-                             model prediction (score) tensors.  Speech-agnostic.
-                             Higher = larger jump in score = worse.
+        "leakage"              — non-speech-to-speech frame-power ratio (reference-free).
+        "wiener_residual"      — Wiener-like residual-to-speech-excess energy ratio over
+                                 speech frames; reference-free SI-SDR proxy.
+                                 Higher = more noise leaking through = worse.
+        "omlsa_residual"       — OMLSA-inspired post-hoc gate converted to waveform via
+                                 model.to_audio; requires model/T_orig/norm_factor/y_np
+                                 in cache.  Higher = worse.
+        "omlsa_residual_tf"    — Pure TF-domain OMLSA/IMCRA-inspired gate.  Operates
+                                 directly on |xt_mean|^2; no waveform conversion needed.
+                                 Higher = worse.
+        "stft_leakage"         — Simple non-speech/speech frame-power ratio on the TF
+                                 spectrogram (sum over F then mean per region).  Matches
+                                 the post-hoc _stft_leakage_score exactly.
+                                 Higher = more leakage = worse.
+        "traj_jump"            — Relative squared displacement between consecutive
+                                 xt_mean tensors.  Speech-agnostic trajectory instability.
+                                 Higher = larger jump = worse.
+        "traj_curvature"       — Normalised squared second difference of consecutive
+                                 xt_mean tensors.  Discrete curvature of the trajectory.
+                                 Higher = sharper bend = worse.
+        "pred_jump"            — Relative squared displacement between consecutive
+                                 model prediction (score) tensors.  Speech-agnostic.
+                                 Higher = larger jump in score = worse.
 
     Adding a new gate requires registering it in the if/elif chain below.
     """
@@ -499,6 +749,10 @@ def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> d
             scores["leakage"] = gate_step_score(step_info, cache)
         elif gate == "wiener_residual":
             scores["wiener_residual"] = gate_step_wiener_residual(step_info, cache)
+        elif gate == "omlsa_residual":
+            scores["omlsa_residual"] = gate_step_omlsa_residual(step_info, cache)
+        elif gate == "omlsa_residual_tf":
+            scores["omlsa_residual_tf"] = gate_step_omlsa_residual_tf(step_info, cache)
         elif gate == "stft_leakage":
             scores["stft_leakage"] = gate_step_stft_leakage(step_info, cache)
         elif gate == "traj_jump":
@@ -740,6 +994,23 @@ def _wiener_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
     E_speech = float(speech_est.sum())
     E_resid  = float(resid_est.sum())
     return min(E_resid / (E_speech + _EPS), 1e6)
+
+
+def _omlsa_residual_tf_posthoc_score(y: np.ndarray, x_hat: np.ndarray) -> float:
+    """Post-hoc wrapper for _omlsa_residual_tf_score.
+
+    Accepts the standard (y, x_hat) waveform pair used by enhancement.py's
+    adaptive-K dispatch.  Computes an STFT of x_hat, then delegates to
+    _omlsa_residual_tf_score.  y is unused (no waveform VAD needed).
+    """
+    import librosa
+    N_FFT, HOP = 512, 128
+    T = min(len(y), len(x_hat))
+    x = np.asarray(x_hat[:T], dtype=np.float32)
+    win = np.hanning(N_FFT).astype(np.float32)
+    S = np.abs(librosa.stft(x, n_fft=N_FFT, hop_length=HOP,
+                             win_length=N_FFT, window=win)) ** 2  # [F, T_frames]
+    return _omlsa_residual_tf_score(S)
 
 
 def _omlsa_residual_score(y: np.ndarray, x_hat: np.ndarray) -> float:
@@ -1185,6 +1456,8 @@ def compute_posthoc_gate_score(
             scores["leakage"] = compute_speech_gate_score(y_np, x_hat_np, mask)
         elif gate == "wiener_residual":
             scores["wiener_residual"] = _wiener_residual_score(y_np, x_hat_np)
+        elif gate == "omlsa_residual":
+            scores["omlsa_residual"] = _omlsa_residual_score(y_np, x_hat_np)
         elif gate == "stft_leakage":
             scores["stft_leakage"] = _stft_leakage_score(y_np, x_hat_np)
         elif gate == "nisqa":
