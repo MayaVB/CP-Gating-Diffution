@@ -261,7 +261,7 @@ def _run_adaptive_k_sampling(
     T_orig          : int   — original waveform length (for model.to_audio)
     norm_factor     : float — amplitude normalisation factor used pre-inference
     y_np            : np.ndarray [T] — normalised noisy input (for score computation)
-    adaptive_score  : str — score function name; "wiener_residual" or "omlsa_residual"
+    adaptive_score  : str — score function name; "wiener_residual", "omlsa_residual", or "omlsa_residual_tf"
 
     Returns
     -------
@@ -276,6 +276,8 @@ def _run_adaptive_k_sampling(
         from utils.speech_gate import _wiener_residual_score as _score_fn
     elif adaptive_score == "omlsa_residual":
         from utils.speech_gate import _omlsa_residual_score as _score_fn
+    elif adaptive_score == "omlsa_residual_tf":
+        from utils.speech_gate import _omlsa_residual_tf_posthoc_score as _score_fn
     else:
         raise ValueError(f"Unknown adaptive_score: {adaptive_score!r}")
 
@@ -342,6 +344,8 @@ def _run_adaptive_k_multilevel_sampling(
         from utils.speech_gate import _wiener_residual_score as _score_fn
     elif adaptive_score == "omlsa_residual":
         from utils.speech_gate import _omlsa_residual_score as _score_fn
+    elif adaptive_score == "omlsa_residual_tf":
+        from utils.speech_gate import _omlsa_residual_tf_posthoc_score as _score_fn
     else:
         raise ValueError(f"Unknown adaptive_score: {adaptive_score!r}")
 
@@ -408,9 +412,11 @@ def _run_mid_wiener_sampling(
            all mid_wiener_kmax tries always run (for offline tau sweep).
 
     Scoring function selected by mid_wiener_score:
-      "wiener_residual" — mid-step latent spectrogram Wiener residual (default)
-      "omlsa_residual"  — convert latent to audio at mid-step, apply OMLSA score;
-                          requires gate_cache to contain model/T_orig/norm_factor/y_np
+      "wiener_residual"    — mid-step latent spectrogram Wiener residual (default)
+      "omlsa_residual"     — convert latent to audio at mid-step, apply OMLSA score;
+                             requires gate_cache to contain model/T_orig/norm_factor/y_np
+      "omlsa_residual_tf"  — full OMLSA score on |xt_mean|² directly in TF domain,
+                             no waveform conversion; requires gate_cache to contain y_PY
 
     Parameters
     ----------
@@ -438,6 +444,8 @@ def _run_mid_wiener_sampling(
         from utils.speech_gate import gate_step_wiener_residual as _gate_fn
     elif mid_wiener_score == "omlsa_residual":
         from utils.speech_gate import gate_step_omlsa_residual as _gate_fn
+    elif mid_wiener_score == "omlsa_residual_tf":
+        from utils.speech_gate import gate_step_omlsa_residual_tf as _gate_fn
     else:
         raise ValueError(f"Unknown mid_wiener_score: {mid_wiener_score!r}")
 
@@ -526,7 +534,7 @@ if __name__ == '__main__':
                         help="Inference policy: 'legacy' = existing per-step gate/restart (default); "
                              "'adaptive_k' = binary difficulty-based K escalation; "
                              "'adaptive_k_multilevel' = multi-level difficulty-based K escalation")
-    parser.add_argument("--adaptive_score", choices=["wiener_residual", "omlsa_residual"], default="wiener_residual",
+    parser.add_argument("--adaptive_score", choices=["wiener_residual", "omlsa_residual", "omlsa_residual_tf"], default="wiener_residual",
                         help="Post-hoc score used for adaptive-K difficulty and selection (default: wiener_residual)")
     parser.add_argument("--adaptive_tau", type=float, default=None,
                         help="Difficulty threshold for adaptive_k policy: if d0 > tau, escalate to K_max tries. "
@@ -550,10 +558,12 @@ if __name__ == '__main__':
                              "If neither is set, all mid_wiener_kmax tries are run for every file (offline sweep mode).")
     parser.add_argument("--mid_wiener_kmax", type=int, default=10,
                         help="Maximum number of tries for mid-step Wiener gating (default: 10)")
-    parser.add_argument("--mid_wiener_score", choices=["wiener_residual", "omlsa_residual"],
+    parser.add_argument("--mid_wiener_score", choices=["wiener_residual", "omlsa_residual", "omlsa_residual_tf"],
                         default="wiener_residual",
                         help="Mid-step scoring function: 'wiener_residual' (default) uses the latent spectrogram; "
-                             "'omlsa_residual' converts latent to audio and applies OMLSA scoring.")
+                             "'omlsa_residual' converts latent to audio and applies OMLSA scoring; "
+                             "'omlsa_residual_tf' applies full OMLSA scoring directly on xt_mean in TF domain "
+                             "(no waveform conversion; requires y_PY cached from model input).")
     parser.add_argument("--mid_omlsa_k_levels", type=str, default=None,
                         help="Multi-level K policy: comma-separated ascending ints, first must be 1. "
                              "E.g. '1,3,5,10'. Requires --mid_omlsa_tau_levels.")
@@ -842,6 +852,11 @@ if __name__ == '__main__':
                 _mw_cache["T_orig"]      = T_orig
                 _mw_cache["norm_factor"] = norm_factor
                 _mw_cache["y_np"]        = y.squeeze().cpu().numpy()
+            elif args.mid_wiener_score == "omlsa_residual_tf":
+                # Option A: use the model-domain noisy power spectrum directly.
+                # Y[0] is [C, F, T_spec]; sum over channels → [F, T_spec].
+                # This is the exact same TF grid as xt_mean, so no STFT mismatch.
+                _mw_cache["y_PY"] = (Y[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
             _mw_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
             (x_hat,
              _mw_scores,
