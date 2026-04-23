@@ -386,32 +386,32 @@ def _run_adaptive_k_multilevel_sampling(
     return x_hats[chosen_try], k_target, chosen_try, d0, best_score, True
 
 
-def _run_mid_wiener_sampling(
+def _run_latent_gate_sampling(
     build_sampler,
-    mid_wiener_step,
-    mid_wiener_kmax,
+    latent_gate_step,
+    latent_gate_kmax,
     base_seed,
     gate_cache,
     model,
     T_orig,
     norm_factor,
-    mid_wiener_tau=None,
-    mid_wiener_score="wiener_residual",
+    latent_gate_threshold=None,
+    latent_gate_score="wiener_residual",
     mid_omlsa_k_levels=None,
     mid_omlsa_tau_levels=None,
 ):
-    """Mid-step score-logging with adaptive multi-try selection.
+    """Mid-step latent-space gating with adaptive multi-try selection.
 
     Always runs try 0 first and records its mid-step score (d0).
     K-selection policy (in priority order):
       1. Multi-level  (mid_omlsa_k_levels + mid_omlsa_tau_levels set):
            d0 mapped to k_target via tau_levels; runs tries 0..k_target-1.
-      2. Binary tau   (mid_wiener_tau set, no k_levels):
-           d0 <= tau → effective_k=1; else run all mid_wiener_kmax tries.
+      2. Binary tau   (latent_gate_threshold set, no k_levels):
+           d0 <= tau → effective_k=1; else run all latent_gate_kmax tries.
       3. Offline mode (neither set):
-           all mid_wiener_kmax tries always run (for offline tau sweep).
+           all latent_gate_kmax tries always run (for offline tau sweep).
 
-    Scoring function selected by mid_wiener_score:
+    Scoring function selected by latent_gate_score:
       "wiener_residual"    — mid-step latent spectrogram Wiener residual (default)
       "omlsa_residual"     — convert latent to audio at mid-step, apply OMLSA score;
                              requires gate_cache to contain model/T_orig/norm_factor/y_np
@@ -420,18 +420,18 @@ def _run_mid_wiener_sampling(
 
     Parameters
     ----------
-    build_sampler          : callable(step_callback=None) → sampler
-    mid_wiener_step        : int         — diffusion step index at which to score
-    mid_wiener_kmax        : int         — max tries when escalating (binary/offline modes)
-    base_seed              : int or None — try j uses base_seed+j; None = no seeding
-    gate_cache             : dict        — scoring cache (see mid_wiener_score above)
-    model                  : ScoreModel
-    T_orig                 : int         — original waveform length (for model.to_audio)
-    norm_factor            : float       — amplitude normalisation factor
-    mid_wiener_tau         : float|None  — binary gating threshold
-    mid_wiener_score       : str         — "wiener_residual" or "omlsa_residual"
-    mid_omlsa_k_levels    : list[int]|None  — ascending K levels, first must be 1
-    mid_omlsa_tau_levels  : list[float]|None — len == len(k_levels)-1
+    build_sampler           : callable(step_callback=None) → sampler
+    latent_gate_step        : int         — diffusion step index at which to score
+    latent_gate_kmax        : int         — max tries when escalating (binary/offline modes)
+    base_seed               : int or None — try j uses base_seed+j; None = no seeding
+    gate_cache              : dict        — scoring cache (see latent_gate_score above)
+    model                   : ScoreModel
+    T_orig                  : int         — original waveform length (for model.to_audio)
+    norm_factor             : float       — amplitude normalisation factor
+    latent_gate_threshold   : float|None  — binary gating threshold
+    latent_gate_score       : str         — scoring function name
+    mid_omlsa_k_levels      : list[int]|None  — ascending K levels, first must be 1
+    mid_omlsa_tau_levels    : list[float]|None — len == len(k_levels)-1
 
     Returns
     -------
@@ -440,22 +440,22 @@ def _run_mid_wiener_sampling(
     chosen_try  : int         — 0-based index of the chosen try
     effective_k : int         — number of tries actually run
     """
-    if mid_wiener_score == "wiener_residual":
+    if latent_gate_score == "wiener_residual":
         from utils.speech_gate import gate_step_wiener_residual as _gate_fn
-    elif mid_wiener_score == "wiener_tf":
+    elif latent_gate_score == "wiener_tf":
         from utils.speech_gate import gate_step_wiener_tf as _gate_fn
-    elif mid_wiener_score == "omlsa_residual":
+    elif latent_gate_score == "omlsa_residual":
         from utils.speech_gate import gate_step_omlsa_residual as _gate_fn
-    elif mid_wiener_score == "omlsa_residual_tf":
+    elif latent_gate_score == "omlsa_residual_tf":
         from utils.speech_gate import gate_step_omlsa_residual_tf as _gate_fn
     else:
-        raise ValueError(f"Unknown mid_wiener_score: {mid_wiener_score!r}")
+        raise ValueError(f"Unknown latent_gate_score: {latent_gate_score!r}")
 
     def _run_try(t):
         """Run one diffusion try, return (x_hat, score)."""
         _score_box = [None]
 
-        def _step_cb(_si, _sb=_score_box, _cache=gate_cache, _target=mid_wiener_step):
+        def _step_cb(_si, _sb=_score_box, _cache=gate_cache, _target=latent_gate_step):
             if _si["step_idx"] == _target:
                 _sb[0] = _gate_fn(_si, _cache)
 
@@ -481,12 +481,12 @@ def _run_mid_wiener_sampling(
             if d0 <= tau:
                 k_target = k
                 break
-    elif mid_wiener_tau is not None:
+    elif latent_gate_threshold is not None:
         # Binary gating
-        k_target = 1 if d0 <= mid_wiener_tau else mid_wiener_kmax
+        k_target = 1 if d0 <= latent_gate_threshold else latent_gate_kmax
     else:
         # Offline mode: always run all tries
-        k_target = mid_wiener_kmax
+        k_target = latent_gate_kmax
 
     # --- Run tries 1..k_target-1 ---
     for _t in range(1, k_target):
@@ -549,18 +549,18 @@ if __name__ == '__main__':
                         help="Comma-separated ascending thresholds for adaptive_k_multilevel. "
                              "Must have length len(k_levels)-1. Example for K=[1,3,5,10]: 'tau1,tau2,tau3' where "
                              "d0<=tau1→K=1, tau1<d0<=tau2→K=3, tau2<d0<=tau3→K=5, d0>tau3→K=10")
-    # --- Mid-step Wiener gating args ---
-    parser.add_argument("--mid_wiener_enable", action="store_true",
-                        help="Enable mid-step Wiener gating policy (mutually exclusive with --policy adaptive_k)")
-    parser.add_argument("--mid_wiener_step", type=int, default=None,
-                        help="Diffusion step index at which to score each try; required with --mid_wiener_enable")
-    parser.add_argument("--mid_wiener_tau", type=float, default=None,
-                        help="Binary gating threshold: skip escalation when d0 <= tau (effective_k=1). "
+    # --- Latent-gate args ---
+    parser.add_argument("--latent_gate_enable", action="store_true",
+                        help="Enable mid-step latent-space gating policy (mutually exclusive with --policy adaptive_k)")
+    parser.add_argument("--latent_gate_step", type=int, default=None,
+                        help="Diffusion step index at which to score each try; required with --latent_gate_enable")
+    parser.add_argument("--latent_gate_threshold", type=float, default=None,
+                        help="Binary gating threshold: skip escalation when d0 <= threshold (effective_k=1). "
                              "Ignored if --mid_omlsa_k_levels is set. "
-                             "If neither is set, all mid_wiener_kmax tries are run for every file (offline sweep mode).")
-    parser.add_argument("--mid_wiener_kmax", type=int, default=10,
-                        help="Maximum number of tries for mid-step Wiener gating (default: 10)")
-    parser.add_argument("--mid_wiener_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf"],
+                             "If neither is set, all latent_gate_kmax tries are run for every file (offline sweep mode).")
+    parser.add_argument("--latent_gate_kmax", type=int, default=10,
+                        help="Maximum number of tries for latent-gate gating (default: 10)")
+    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf"],
                         default="wiener_residual",
                         help="Mid-step scoring function: 'wiener_residual' (default) uses static median noise; "
                              "'wiener_tf' uses IMCRA adaptive noise tracking on model-domain PY (no waveform conversion); "
@@ -602,37 +602,37 @@ if __name__ == '__main__':
         args._k_levels   = _k_levels
         args._tau_levels = _tau_levels
 
-    if args.mid_wiener_enable:
-        if args.mid_wiener_step is None:
-            raise ValueError("--mid_wiener_step is required when --mid_wiener_enable")
+    if args.latent_gate_enable:
+        if args.latent_gate_step is None:
+            raise ValueError("--latent_gate_step is required when --latent_gate_enable")
         if args.policy == "adaptive_k":
-            raise ValueError("--mid_wiener_enable and --policy adaptive_k are mutually exclusive")
+            raise ValueError("--latent_gate_enable and --policy adaptive_k are mutually exclusive")
         if args.mid_omlsa_k_levels is not None:
             if args.mid_omlsa_tau_levels is None:
                 raise ValueError("--mid_omlsa_tau_levels is required when --mid_omlsa_k_levels is set")
             try:
-                _mw_k_levels = [int(x) for x in args.mid_omlsa_k_levels.split(",")]
+                _lg_k_levels = [int(x) for x in args.mid_omlsa_k_levels.split(",")]
             except ValueError:
                 raise ValueError(f"--mid_omlsa_k_levels must be comma-separated ints, got: {args.mid_omlsa_k_levels!r}")
             try:
-                _mw_tau_levels = [float(x) for x in args.mid_omlsa_tau_levels.split(",")]
+                _lg_tau_levels = [float(x) for x in args.mid_omlsa_tau_levels.split(",")]
             except ValueError:
                 raise ValueError(f"--mid_omlsa_tau_levels must be comma-separated floats, got: {args.mid_omlsa_tau_levels!r}")
-            if _mw_k_levels[0] != 1:
-                raise ValueError(f"First mid_omlsa_k_levels value must be 1, got: {_mw_k_levels[0]}")
-            if _mw_k_levels != sorted(set(_mw_k_levels)):
-                raise ValueError(f"--mid_omlsa_k_levels must be strictly ascending, got: {_mw_k_levels}")
-            if _mw_tau_levels != sorted(_mw_tau_levels):
-                raise ValueError(f"--mid_omlsa_tau_levels must be ascending, got: {_mw_tau_levels}")
-            if len(_mw_tau_levels) != len(_mw_k_levels) - 1:
+            if _lg_k_levels[0] != 1:
+                raise ValueError(f"First mid_omlsa_k_levels value must be 1, got: {_lg_k_levels[0]}")
+            if _lg_k_levels != sorted(set(_lg_k_levels)):
+                raise ValueError(f"--mid_omlsa_k_levels must be strictly ascending, got: {_lg_k_levels}")
+            if _lg_tau_levels != sorted(_lg_tau_levels):
+                raise ValueError(f"--mid_omlsa_tau_levels must be ascending, got: {_lg_tau_levels}")
+            if len(_lg_tau_levels) != len(_lg_k_levels) - 1:
                 raise ValueError(
-                    f"len(tau_levels)={len(_mw_tau_levels)} must equal len(k_levels)-1={len(_mw_k_levels)-1}"
+                    f"len(tau_levels)={len(_lg_tau_levels)} must equal len(k_levels)-1={len(_lg_k_levels)-1}"
                 )
-            args._mw_omlsa_k_levels   = _mw_k_levels
-            args._mw_omlsa_tau_levels = _mw_tau_levels
+            args._lg_omlsa_k_levels   = _lg_k_levels
+            args._lg_omlsa_tau_levels = _lg_tau_levels
         else:
-            args._mw_omlsa_k_levels   = None
-            args._mw_omlsa_tau_levels = None
+            args._lg_omlsa_k_levels   = None
+            args._lg_omlsa_tau_levels = None
 
     # --- Adaptive-K: warn once about legacy-only args that are active but will be ignored ---
     if args.policy in ("adaptive_k", "adaptive_k_multilevel"):
@@ -775,8 +775,8 @@ if __name__ == '__main__':
 
     # Per-utterance log for adaptive_k / adaptive_k_multilevel mode
     _ak_log = [] if args.policy in ("adaptive_k", "adaptive_k_multilevel") else None
-    # Per-utterance log for mid_wiener mode
-    _mw_log = [] if args.mid_wiener_enable else None
+    # Per-utterance log for latent gate mode
+    _lg_log = [] if args.latent_gate_enable else None
 
     # Enhance files
     for _utt_idx, noisy_file in enumerate(tqdm(noisy_files)):
@@ -837,66 +837,66 @@ if __name__ == '__main__':
 
         # -----------------------------------------------------------------------
         # Dispatch: mutually exclusive inference paths
-        #   0. mid_wiener  — mid-step Wiener gating with multi-try selection
+        #   0. latent_gate — mid-step latent-space gating with multi-try selection
         #   1. adaptive_k  — reference-free difficulty-based K escalation
         #   2. legacy CP   — per-step gate + restart (gate_tau_path / gate_compute_tau)
         #   3. plain       — single-pass diffusion, no gating
         # Legacy gating args (gate_tau_path, gate_compute_tau, gates, gate_combine, …)
         # are intentionally ignored in adaptive_k mode; a startup warning lists them.
         # -----------------------------------------------------------------------
-        if args.mid_wiener_enable:
+        if args.latent_gate_enable:
             _yf_power = (Y[0].abs() ** 2).sum(dim=(0, 1)).detach().cpu().numpy()
-            _mw_cache = {
+            _lg_cache = {
                 "speech_mask_frames": _yf_power > np.percentile(_yf_power, 80),
                 "eps": 1e-8,
             }
-            if args.mid_wiener_score == "omlsa_residual":
-                _mw_cache["model"]       = model
-                _mw_cache["T_orig"]      = T_orig
-                _mw_cache["norm_factor"] = norm_factor
-                _mw_cache["y_np"]        = y.squeeze().cpu().numpy()
-            elif args.mid_wiener_score in ("omlsa_residual_tf", "wiener_tf"):
+            if args.latent_gate_score == "omlsa_residual":
+                _lg_cache["model"]       = model
+                _lg_cache["T_orig"]      = T_orig
+                _lg_cache["norm_factor"] = norm_factor
+                _lg_cache["y_np"]        = y.squeeze().cpu().numpy()
+            elif args.latent_gate_score in ("omlsa_residual_tf", "wiener_tf"):
                 # Option A: use the model-domain noisy power spectrum directly.
                 # Y[0] is [C, F, T_spec]; sum over channels → [F, T_spec].
                 # This is the exact same TF grid as xt_mean, so no STFT mismatch.
-                _mw_cache["y_PY"] = (Y[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
-            _mw_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
+                _lg_cache["y_PY"] = (Y[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+            _lg_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
             (x_hat,
-             _mw_scores,
-             _mw_chosen_try,
-             _mw_effective_k) = _run_mid_wiener_sampling(
+             _lg_scores,
+             _lg_chosen_try,
+             _lg_effective_k) = _run_latent_gate_sampling(
                 build_sampler=_build_sampler,
-                mid_wiener_step=args.mid_wiener_step,
-                mid_wiener_kmax=args.mid_wiener_kmax,
-                base_seed=_mw_base_seed,
-                gate_cache=_mw_cache,
+                latent_gate_step=args.latent_gate_step,
+                latent_gate_kmax=args.latent_gate_kmax,
+                base_seed=_lg_base_seed,
+                gate_cache=_lg_cache,
                 model=model,
                 T_orig=T_orig,
                 norm_factor=norm_factor,
-                mid_wiener_tau=args.mid_wiener_tau,
-                mid_wiener_score=args.mid_wiener_score,
-                mid_omlsa_k_levels=args._mw_omlsa_k_levels,
-                mid_omlsa_tau_levels=args._mw_omlsa_tau_levels,
+                latent_gate_threshold=args.latent_gate_threshold,
+                latent_gate_score=args.latent_gate_score,
+                mid_omlsa_k_levels=args._lg_omlsa_k_levels,
+                mid_omlsa_tau_levels=args._lg_omlsa_tau_levels,
             )
-            _mw_score_try0   = _mw_scores[0]
-            _mw_chosen_score = _mw_scores[_mw_chosen_try]
-            print(f"[mid_wiener] file={filename}  utt_idx={_utt_idx}  "
-                  f"base_seed={_mw_base_seed}  effective_k={_mw_effective_k}  "
-                  f"score_try0={_mw_score_try0:.4f}  "
-                  f"chosen_try={_mw_chosen_try}  chosen_score={_mw_chosen_score:.4f}")
-            _mw_scores_finite = [s if s != float("inf") else None for s in _mw_scores]
-            _mw_log.append({
-                "utterance_idx":   _utt_idx,
-                "filename":        filename,
-                "base_seed_used":  _mw_base_seed,
-                "mid_wiener_step": args.mid_wiener_step,
-                "mid_wiener_kmax": args.mid_wiener_kmax,
-                "effective_k":     _mw_effective_k,
-                "score_try0":      round(float(_mw_score_try0), 6) if _mw_score_try0 != float("inf") else "",
-                "chosen_try":      _mw_chosen_try,
-                "chosen_score":    round(float(_mw_chosen_score), 6) if _mw_chosen_score != float("inf") else "",
-                "scores_all":      json.dumps([round(float(s), 6) if s is not None else None
-                                               for s in _mw_scores_finite]),
+            _lg_score_try0   = _lg_scores[0]
+            _lg_chosen_score = _lg_scores[_lg_chosen_try]
+            print(f"[latent_gate] file={filename}  utt_idx={_utt_idx}  "
+                  f"base_seed={_lg_base_seed}  effective_k={_lg_effective_k}  "
+                  f"score_try0={_lg_score_try0:.4f}  "
+                  f"chosen_try={_lg_chosen_try}  chosen_score={_lg_chosen_score:.4f}")
+            _lg_scores_finite = [s if s != float("inf") else None for s in _lg_scores]
+            _lg_log.append({
+                "utterance_idx":      _utt_idx,
+                "filename":           filename,
+                "base_seed_used":     _lg_base_seed,
+                "latent_gate_step":   args.latent_gate_step,
+                "latent_gate_kmax":   args.latent_gate_kmax,
+                "effective_k":        _lg_effective_k,
+                "score_try0":         round(float(_lg_score_try0), 6) if _lg_score_try0 != float("inf") else "",
+                "chosen_try":         _lg_chosen_try,
+                "chosen_score":       round(float(_lg_chosen_score), 6) if _lg_chosen_score != float("inf") else "",
+                "scores_all":         json.dumps([round(float(s), 6) if s is not None else None
+                                                  for s in _lg_scores_finite]),
             })
             makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
             write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
@@ -1169,25 +1169,24 @@ if __name__ == '__main__':
 
         _save_steps_utt_idx[0] += 1
 
-    if args.mid_wiener_enable and _mw_log:
-        _mw_csv_path = join(args.enhanced_dir, "mid_wiener_log.csv")
-        _mw_fields = ["utterance_idx", "filename", "base_seed_used",
-                      "mid_wiener_step", "mid_wiener_kmax",
+    if args.latent_gate_enable and _lg_log:
+        _lg_csv_path = join(args.enhanced_dir, "latent_gate_log.csv")
+        _lg_fields = ["utterance_idx", "filename", "base_seed_used",
+                      "latent_gate_step", "latent_gate_kmax",
                       "effective_k", "score_try0", "chosen_try", "chosen_score",
                       "scores_all"]
-        with open(_mw_csv_path, "w", newline="") as _f:
-            _writer = csv.DictWriter(_f, fieldnames=_mw_fields)
+        with open(_lg_csv_path, "w", newline="") as _f:
+            _writer = csv.DictWriter(_f, fieldnames=_lg_fields)
             _writer.writeheader()
-            _writer.writerows(_mw_log)
-        _n_mw = len(_mw_log)
-        _mean_chosen_try = sum(r["chosen_try"] for r in _mw_log) / _n_mw
-        _n_chose_try0 = sum(1 for r in _mw_log if r["chosen_try"] == 0)
-        print(f"\nMid-Wiener log saved to {_mw_csv_path}")
-        print("\n--- Mid-Wiener Run Summary ---")
-        print(f"n_files             = {_n_mw}")
+            _writer.writerows(_lg_log)
+        _n_lg = len(_lg_log)
+        _mean_chosen_try = sum(r["chosen_try"] for r in _lg_log) / _n_lg
+        _n_chose_try0 = sum(1 for r in _lg_log if r["chosen_try"] == 0)
+        print(f"\nLatent-gate log saved to {_lg_csv_path}")
+        print("\n--- Latent-Gate Run Summary ---")
+        print(f"n_files             = {_n_lg}")
         print(f"mean_chosen_try     = {_mean_chosen_try:.2f}")
-        print(f"n_chose_try0        = {_n_chose_try0}  ({_n_chose_try0 / _n_mw:.1%})")
-        print(f"sweep tau offline:    python sweep_mid_wiener_tau.py --log_csv {_mw_csv_path}")
+        print(f"n_chose_try0        = {_n_chose_try0}  ({_n_chose_try0 / _n_lg:.1%})")
 
     if args.gate_compute_tau:
         if args.gate_plot:
