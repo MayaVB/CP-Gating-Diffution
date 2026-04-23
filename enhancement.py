@@ -442,6 +442,8 @@ def _run_mid_wiener_sampling(
     """
     if mid_wiener_score == "wiener_residual":
         from utils.speech_gate import gate_step_wiener_residual as _gate_fn
+    elif mid_wiener_score == "wiener_tf":
+        from utils.speech_gate import gate_step_wiener_tf as _gate_fn
     elif mid_wiener_score == "omlsa_residual":
         from utils.speech_gate import gate_step_omlsa_residual as _gate_fn
     elif mid_wiener_score == "omlsa_residual_tf":
@@ -558,10 +560,11 @@ if __name__ == '__main__':
                              "If neither is set, all mid_wiener_kmax tries are run for every file (offline sweep mode).")
     parser.add_argument("--mid_wiener_kmax", type=int, default=10,
                         help="Maximum number of tries for mid-step Wiener gating (default: 10)")
-    parser.add_argument("--mid_wiener_score", choices=["wiener_residual", "omlsa_residual", "omlsa_residual_tf"],
+    parser.add_argument("--mid_wiener_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf"],
                         default="wiener_residual",
-                        help="Mid-step scoring function: 'wiener_residual' (default) uses the latent spectrogram; "
-                             "'omlsa_residual' converts latent to audio and applies OMLSA scoring; "
+                        help="Mid-step scoring function: 'wiener_residual' (default) uses static median noise; "
+                             "'wiener_tf' uses IMCRA adaptive noise tracking on model-domain PY (no waveform conversion); "
+                             "'omlsa_residual' converts latent to audio and applies full OMLSA scoring; "
                              "'omlsa_residual_tf' applies full OMLSA scoring directly on xt_mean in TF domain "
                              "(no waveform conversion; requires y_PY cached from model input).")
     parser.add_argument("--mid_omlsa_k_levels", type=str, default=None,
@@ -852,7 +855,7 @@ if __name__ == '__main__':
                 _mw_cache["T_orig"]      = T_orig
                 _mw_cache["norm_factor"] = norm_factor
                 _mw_cache["y_np"]        = y.squeeze().cpu().numpy()
-            elif args.mid_wiener_score == "omlsa_residual_tf":
+            elif args.mid_wiener_score in ("omlsa_residual_tf", "wiener_tf"):
                 # Option A: use the model-domain noisy power spectrum directly.
                 # Y[0] is [C, F, T_spec]; sum over channels → [F, T_spec].
                 # This is the exact same TF grid as xt_mean, so no STFT mismatch.
