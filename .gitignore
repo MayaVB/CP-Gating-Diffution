@@ -11,6 +11,7 @@ wsj0_chime3/
 dns_noreverb/
 dns/
 urgent2025/
+old/
 
 ### Emacs ###
 # -*- mode: gitignore; -*-
