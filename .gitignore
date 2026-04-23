@@ -8,6 +8,9 @@ checkpoints_updated/
 voicebank/
 nisqa_weights/
 wsj0_chime3/
+dns_noreverb/
+dns/
+urgent2025/
 
 ### Emacs ###
 # -*- mode: gitignore; -*-
