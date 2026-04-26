@@ -386,6 +386,25 @@ def _run_adaptive_k_multilevel_sampling(
     return x_hats[chosen_try], k_target, chosen_try, d0, best_score, True
 
 
+def _save_latent_cache(save_dir, filename, xt_box, gate_cache):
+    """Save xt_mean and PY for one utterance to a .npz file.
+
+    Only runs when save_dir is set and xt_box[0] was populated.
+    xt_mean = complex64 [C, F, T_spec] — full latent at the gate step.
+              Sufficient to reconstruct any TF-domain score offline.
+    PY      = noisy input power spectrum [F, T_spec] (from gate_cache["y_PY"])
+    """
+    if save_dir is None or xt_box is None or xt_box[0] is None:
+        return
+    import os
+    makedirs(save_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(filename))[0] if filename else "unknown"
+    out_path = os.path.join(save_dir, f"{stem}.npz")
+    xt_mean = xt_box[0]                       # complex64 [C, F, T_spec]
+    PY = gate_cache.get("y_PY", None)
+    np.savez_compressed(out_path, xt_mean=xt_mean, **({} if PY is None else {"PY": PY}))
+
+
 def _run_latent_gate_sampling(
     build_sampler,
     latent_gate_step,
@@ -397,19 +416,33 @@ def _run_latent_gate_sampling(
     norm_factor,
     latent_gate_threshold=None,
     latent_gate_score="wiener_residual",
+    latent_gate_policy="best_of_k",
+    latent_gate_max_retries=10,
     mid_omlsa_k_levels=None,
     mid_omlsa_tau_levels=None,
+    save_latents_dir=None,
+    save_latents_filename=None,
 ):
     """Mid-step latent-space gating with adaptive multi-try selection.
 
-    Always runs try 0 first and records its mid-step score (d0).
-    K-selection policy (in priority order):
-      1. Multi-level  (mid_omlsa_k_levels + mid_omlsa_tau_levels set):
-           d0 mapped to k_target via tau_levels; runs tries 0..k_target-1.
-      2. Binary tau   (latent_gate_threshold set, no k_levels):
-           d0 <= tau → effective_k=1; else run all latent_gate_kmax tries.
-      3. Offline mode (neither set):
-           all latent_gate_kmax tries always run (for offline tau sweep).
+    Two top-level policies, selected by latent_gate_policy:
+
+    "best_of_k" (default — existing behavior):
+      Runs a fixed batch of tries and returns the one with the lowest score.
+      K-selection sub-policy (in priority order):
+        1. Multi-level  (mid_omlsa_k_levels + mid_omlsa_tau_levels set):
+             d0 mapped to k_target via tau_levels; runs tries 0..k_target-1.
+        2. Binary tau   (latent_gate_threshold set, no k_levels):
+             d0 <= tau → effective_k=1; else run all latent_gate_kmax tries.
+        3. Offline mode (neither set):
+             all latent_gate_kmax tries always run (for offline tau sweep).
+
+    "sequential_threshold":
+      Accepts the first try whose score <= latent_gate_threshold, stopping early.
+      Falls back to the lowest-score try if no try passes within the retry budget.
+      - try 0 always runs first
+      - up to latent_gate_max_retries additional retries (total max = 1 + latent_gate_max_retries)
+      - stop_reason: "passed_threshold" | "hit_retry_cap"
 
     Scoring function selected by latent_gate_score:
       "wiener_residual"    — mid-step latent spectrogram Wiener residual (default)
@@ -420,18 +453,20 @@ def _run_latent_gate_sampling(
 
     Parameters
     ----------
-    build_sampler           : callable(step_callback=None) → sampler
-    latent_gate_step        : int         — diffusion step index at which to score
-    latent_gate_kmax        : int         — max tries when escalating (binary/offline modes)
-    base_seed               : int or None — try j uses base_seed+j; None = no seeding
-    gate_cache              : dict        — scoring cache (see latent_gate_score above)
-    model                   : ScoreModel
-    T_orig                  : int         — original waveform length (for model.to_audio)
-    norm_factor             : float       — amplitude normalisation factor
-    latent_gate_threshold   : float|None  — binary gating threshold
-    latent_gate_score       : str         — scoring function name
-    mid_omlsa_k_levels      : list[int]|None  — ascending K levels, first must be 1
-    mid_omlsa_tau_levels    : list[float]|None — len == len(k_levels)-1
+    build_sampler            : callable(step_callback=None) → sampler
+    latent_gate_step         : int         — diffusion step index at which to score
+    latent_gate_kmax         : int         — max tries for best_of_k sub-policies
+    base_seed                : int or None — try j uses base_seed+j; None = no seeding
+    gate_cache               : dict        — scoring cache (see latent_gate_score above)
+    model                    : ScoreModel
+    T_orig                   : int         — original waveform length (for model.to_audio)
+    norm_factor              : float       — amplitude normalisation factor
+    latent_gate_threshold    : float|None  — gating threshold (used by both policies)
+    latent_gate_score        : str         — scoring function name
+    latent_gate_policy       : str         — "best_of_k" or "sequential_threshold"
+    latent_gate_max_retries  : int         — max additional retries for sequential_threshold
+    mid_omlsa_k_levels       : list[int]|None  — ascending K levels, first must be 1
+    mid_omlsa_tau_levels     : list[float]|None — len == len(k_levels)-1
 
     Returns
     -------
@@ -439,6 +474,7 @@ def _run_latent_gate_sampling(
     scores      : list[float] — mid-step score for each try actually run
     chosen_try  : int         — 0-based index of the chosen try
     effective_k : int         — number of tries actually run
+    stop_reason : str         — "best_of_k" | "passed_threshold" | "hit_retry_cap"
     """
     if latent_gate_score == "wiener_residual":
         from utils.speech_gate import gate_step_wiener_residual as _gate_fn
@@ -448,16 +484,27 @@ def _run_latent_gate_sampling(
         from utils.speech_gate import gate_step_omlsa_residual as _gate_fn
     elif latent_gate_score == "omlsa_residual_tf":
         from utils.speech_gate import gate_step_omlsa_residual_tf as _gate_fn
+    elif latent_gate_score == "omlsa_residual_tf_simplified_v1":
+        from utils.speech_gate import gate_step_omlsa_residual_tf_simplified_v1 as _gate_fn
     else:
         raise ValueError(f"Unknown latent_gate_score: {latent_gate_score!r}")
 
-    def _run_try(t):
-        """Run one diffusion try, return (x_hat, score)."""
+    def _run_try(t, _xt_box=None):
+        """Run one diffusion try, return (x_hat, score).
+
+        _xt_box: if a 1-element list is passed, xt_mean[0] (complex64 numpy
+                 [C, F, T_spec]) is stored in _xt_box[0] at the gate step.
+                 Used for latent cache saving (try 0 only); supports offline
+                 rescoring with any TF-domain score function.
+        """
         _score_box = [None]
 
-        def _step_cb(_si, _sb=_score_box, _cache=gate_cache, _target=latent_gate_step):
+        def _step_cb(_si, _sb=_score_box, _cache=gate_cache, _target=latent_gate_step,
+                     _xt=_xt_box):
             if _si["step_idx"] == _target:
                 _sb[0] = _gate_fn(_si, _cache)
+                if _xt is not None:
+                    _xt[0] = _si["xt_mean"][0].detach().cpu().numpy()  # complex64 [C, F, T]
 
         if base_seed is not None:
             _set_seeds(base_seed + t)
@@ -466,8 +513,41 @@ def _run_latent_gate_sampling(
         score = _score_box[0] if _score_box[0] is not None else float("inf")
         return x_hat_t, score
 
+    # -----------------------------------------------------------------------
+    # Policy: sequential_threshold
+    # -----------------------------------------------------------------------
+    if latent_gate_policy == "sequential_threshold":
+        _xt_box = [None] if save_latents_dir else None
+        x_hat_0, d0 = _run_try(0, _xt_box=_xt_box)
+        _save_latent_cache(save_latents_dir, save_latents_filename, _xt_box, gate_cache)
+        scores     = [d0]
+        best_score = d0
+        best_x_hat = x_hat_0
+        best_try   = 0
+
+        if d0 <= latent_gate_threshold:
+            return x_hat_0, scores, 0, 1, "passed_threshold"
+
+        for _t in range(1, latent_gate_max_retries + 1):
+            x_hat_t, score = _run_try(_t)
+            scores.append(score)
+            if score < best_score:
+                best_score = score
+                best_x_hat = x_hat_t
+                best_try   = _t
+            if score <= latent_gate_threshold:
+                return x_hat_t, scores, _t, _t + 1, "passed_threshold"
+
+        # No try passed threshold — return best seen
+        return best_x_hat, scores, best_try, latent_gate_max_retries + 1, "hit_retry_cap"
+
+    # -----------------------------------------------------------------------
+    # Policy: best_of_k (existing behavior)
+    # -----------------------------------------------------------------------
     # --- Try 0 (always run first) ---
-    x_hat_0, d0 = _run_try(0)
+    _xt_box = [None] if save_latents_dir else None
+    x_hat_0, d0 = _run_try(0, _xt_box=_xt_box)
+    _save_latent_cache(save_latents_dir, save_latents_filename, _xt_box, gate_cache)
     scores     = [d0]
     best_score = d0
     best_x_hat = x_hat_0
@@ -497,7 +577,7 @@ def _run_latent_gate_sampling(
             best_x_hat = x_hat_t
             chosen_try = _t
 
-    return best_x_hat, scores, chosen_try, k_target
+    return best_x_hat, scores, chosen_try, k_target, "best_of_k"
 
 
 if __name__ == '__main__':
@@ -559,14 +639,28 @@ if __name__ == '__main__':
                              "Ignored if --mid_omlsa_k_levels is set. "
                              "If neither is set, all latent_gate_kmax tries are run for every file (offline sweep mode).")
     parser.add_argument("--latent_gate_kmax", type=int, default=10,
-                        help="Maximum number of tries for latent-gate gating (default: 10)")
-    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf"],
+                        help="Maximum number of tries for best_of_k policy (default: 10)")
+    parser.add_argument("--latent_gate_policy", choices=["best_of_k", "sequential_threshold"],
+                        default="best_of_k",
+                        help="Latent-gate selection policy: 'best_of_k' (default) runs a fixed batch and returns "
+                             "the lowest-score try; 'sequential_threshold' accepts the first try that passes "
+                             "--latent_gate_threshold, falling back to best seen if none pass within "
+                             "--latent_gate_max_retries retries.")
+    parser.add_argument("--latent_gate_max_retries", type=int, default=10,
+                        help="Max additional retries after try 0 for sequential_threshold policy "
+                             "(total max samples = 1 + latent_gate_max_retries; default: 10)")
+    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_residual_tf_simplified_v1"],
                         default="wiener_residual",
                         help="Mid-step scoring function: 'wiener_residual' (default) uses static median noise; "
                              "'wiener_tf' uses IMCRA adaptive noise tracking on model-domain PY (no waveform conversion); "
                              "'omlsa_residual' converts latent to audio and applies full OMLSA scoring; "
                              "'omlsa_residual_tf' applies full OMLSA scoring directly on xt_mean in TF domain "
-                             "(no waveform conversion; requires y_PY cached from model input).")
+                             "(no waveform conversion; requires y_PY cached from model input); "
+                             "'omlsa_residual_tf_simplified_v1' same backbone, simplified score: (noise_excess + λ·speech_resid) / speech_keep.")
+    parser.add_argument("--latent_gate_save_latents", type=str, default=None,
+                        metavar="DIR",
+                        help="If set, save per-file latent cache (PX, PY as .npz) to DIR after try 0. "
+                             "Use during calibration runs to enable fast offline rescoring without re-running diffusion.")
     parser.add_argument("--mid_omlsa_k_levels", type=str, default=None,
                         help="Multi-level K policy: comma-separated ascending ints, first must be 1. "
                              "E.g. '1,3,5,10'. Requires --mid_omlsa_tau_levels.")
@@ -855,7 +949,7 @@ if __name__ == '__main__':
                 _lg_cache["T_orig"]      = T_orig
                 _lg_cache["norm_factor"] = norm_factor
                 _lg_cache["y_np"]        = y.squeeze().cpu().numpy()
-            elif args.latent_gate_score in ("omlsa_residual_tf", "wiener_tf"):
+            elif args.latent_gate_score in ("omlsa_residual_tf", "omlsa_residual_tf_simplified_v1", "wiener_tf"):
                 # Option A: use the model-domain noisy power spectrum directly.
                 # Y[0] is [C, F, T_spec]; sum over channels → [F, T_spec].
                 # This is the exact same TF grid as xt_mean, so no STFT mismatch.
@@ -864,7 +958,8 @@ if __name__ == '__main__':
             (x_hat,
              _lg_scores,
              _lg_chosen_try,
-             _lg_effective_k) = _run_latent_gate_sampling(
+             _lg_effective_k,
+             _lg_stop_reason) = _run_latent_gate_sampling(
                 build_sampler=_build_sampler,
                 latent_gate_step=args.latent_gate_step,
                 latent_gate_kmax=args.latent_gate_kmax,
@@ -875,13 +970,20 @@ if __name__ == '__main__':
                 norm_factor=norm_factor,
                 latent_gate_threshold=args.latent_gate_threshold,
                 latent_gate_score=args.latent_gate_score,
+                latent_gate_policy=args.latent_gate_policy,
+                latent_gate_max_retries=args.latent_gate_max_retries,
                 mid_omlsa_k_levels=args._lg_omlsa_k_levels,
                 mid_omlsa_tau_levels=args._lg_omlsa_tau_levels,
+                save_latents_dir=args.latent_gate_save_latents,
+                save_latents_filename=filename,
             )
             _lg_score_try0   = _lg_scores[0]
             _lg_chosen_score = _lg_scores[_lg_chosen_try]
+            _lg_best_try     = int(np.argmin([s if s != float("inf") else float("inf") for s in _lg_scores]))
+            _lg_best_score   = _lg_scores[_lg_best_try]
             print(f"[latent_gate] file={filename}  utt_idx={_utt_idx}  "
-                  f"base_seed={_lg_base_seed}  effective_k={_lg_effective_k}  "
+                  f"policy={args.latent_gate_policy}  base_seed={_lg_base_seed}  "
+                  f"effective_k={_lg_effective_k}  stop_reason={_lg_stop_reason}  "
                   f"score_try0={_lg_score_try0:.4f}  "
                   f"chosen_try={_lg_chosen_try}  chosen_score={_lg_chosen_score:.4f}")
             _lg_scores_finite = [s if s != float("inf") else None for s in _lg_scores]
@@ -889,12 +991,18 @@ if __name__ == '__main__':
                 "utterance_idx":      _utt_idx,
                 "filename":           filename,
                 "base_seed_used":     _lg_base_seed,
+                "policy":             args.latent_gate_policy,
                 "latent_gate_step":   args.latent_gate_step,
                 "latent_gate_kmax":   args.latent_gate_kmax,
-                "effective_k":        _lg_effective_k,
+                "threshold":          args.latent_gate_threshold if args.latent_gate_threshold is not None else "",
+                "num_total_tries":    _lg_effective_k,
+                "num_retries_used":   _lg_effective_k - 1,
+                "stop_reason":        _lg_stop_reason,
                 "score_try0":         round(float(_lg_score_try0), 6) if _lg_score_try0 != float("inf") else "",
-                "chosen_try":         _lg_chosen_try,
-                "chosen_score":       round(float(_lg_chosen_score), 6) if _lg_chosen_score != float("inf") else "",
+                "accepted_try":       _lg_chosen_try,
+                "accepted_score":     round(float(_lg_chosen_score), 6) if _lg_chosen_score != float("inf") else "",
+                "best_try":           _lg_best_try,
+                "best_score":         round(float(_lg_best_score), 6) if _lg_best_score != float("inf") else "",
                 "scores_all":         json.dumps([round(float(s), 6) if s is not None else None
                                                   for s in _lg_scores_finite]),
             })
@@ -1172,16 +1280,17 @@ if __name__ == '__main__':
     if args.latent_gate_enable and _lg_log:
         _lg_csv_path = join(args.enhanced_dir, "latent_gate_log.csv")
         _lg_fields = ["utterance_idx", "filename", "base_seed_used",
-                      "latent_gate_step", "latent_gate_kmax",
-                      "effective_k", "score_try0", "chosen_try", "chosen_score",
-                      "scores_all"]
+                      "policy", "latent_gate_step", "latent_gate_kmax", "threshold",
+                      "num_total_tries", "num_retries_used", "stop_reason",
+                      "score_try0", "accepted_try", "accepted_score",
+                      "best_try", "best_score", "scores_all"]
         with open(_lg_csv_path, "w", newline="") as _f:
             _writer = csv.DictWriter(_f, fieldnames=_lg_fields)
             _writer.writeheader()
             _writer.writerows(_lg_log)
         _n_lg = len(_lg_log)
-        _mean_chosen_try = sum(r["chosen_try"] for r in _lg_log) / _n_lg
-        _n_chose_try0 = sum(1 for r in _lg_log if r["chosen_try"] == 0)
+        _mean_chosen_try = sum(r["accepted_try"] for r in _lg_log) / _n_lg
+        _n_chose_try0 = sum(1 for r in _lg_log if r["accepted_try"] == 0)
         print(f"\nLatent-gate log saved to {_lg_csv_path}")
         print("\n--- Latent-Gate Run Summary ---")
         print(f"n_files             = {_n_lg}")
