@@ -484,8 +484,8 @@ def _run_latent_gate_sampling(
         from utils.speech_gate import gate_step_omlsa_residual as _gate_fn
     elif latent_gate_score == "omlsa_residual_tf":
         from utils.speech_gate import gate_step_omlsa_residual_tf as _gate_fn
-    elif latent_gate_score == "omlsa_residual_tf_simplified_v1":
-        from utils.speech_gate import gate_step_omlsa_residual_tf_simplified_v1 as _gate_fn
+    elif latent_gate_score == "omlsa_gating":
+        from utils.speech_gate import gate_step_omlsa_gating as _gate_fn
     else:
         raise ValueError(f"Unknown latent_gate_score: {latent_gate_score!r}")
 
@@ -539,6 +539,33 @@ def _run_latent_gate_sampling(
                 return x_hat_t, scores, _t, _t + 1, "passed_threshold"
 
         # No try passed threshold — return best seen
+        return best_x_hat, scores, best_try, latent_gate_max_retries + 1, "hit_retry_cap"
+
+    if latent_gate_policy == "sequential_threshold_above":
+        # Higher score = better. Accept first try with score >= threshold.
+        # Fallback: return the highest-score try seen.
+        _xt_box = [None] if save_latents_dir else None
+        x_hat_0, d0 = _run_try(0, _xt_box=_xt_box)
+        _save_latent_cache(save_latents_dir, save_latents_filename, _xt_box, gate_cache)
+        scores     = [d0]
+        best_score = d0
+        best_x_hat = x_hat_0
+        best_try   = 0
+
+        if d0 >= latent_gate_threshold:
+            return x_hat_0, scores, 0, 1, "passed_threshold"
+
+        for _t in range(1, latent_gate_max_retries + 1):
+            x_hat_t, score = _run_try(_t)
+            scores.append(score)
+            if score > best_score:
+                best_score = score
+                best_x_hat = x_hat_t
+                best_try   = _t
+            if score >= latent_gate_threshold:
+                return x_hat_t, scores, _t, _t + 1, "passed_threshold"
+
+        # No try passed threshold — return best (highest) seen
         return best_x_hat, scores, best_try, latent_gate_max_retries + 1, "hit_retry_cap"
 
     # -----------------------------------------------------------------------
@@ -640,23 +667,23 @@ if __name__ == '__main__':
                              "If neither is set, all latent_gate_kmax tries are run for every file (offline sweep mode).")
     parser.add_argument("--latent_gate_kmax", type=int, default=10,
                         help="Maximum number of tries for best_of_k policy (default: 10)")
-    parser.add_argument("--latent_gate_policy", choices=["best_of_k", "sequential_threshold"],
+    parser.add_argument("--latent_gate_policy", choices=["best_of_k", "sequential_threshold", "sequential_threshold_above"],
                         default="best_of_k",
                         help="Latent-gate selection policy: 'best_of_k' (default) runs a fixed batch and returns "
-                             "the lowest-score try; 'sequential_threshold' accepts the first try that passes "
-                             "--latent_gate_threshold, falling back to best seen if none pass within "
-                             "--latent_gate_max_retries retries.")
+                             "the lowest-score try; 'sequential_threshold' accepts the first try with score <= threshold "
+                             "(lower=better scores); 'sequential_threshold_above' accepts the first try with score >= threshold "
+                             "(higher=better scores); both fall back to best seen if none pass within --latent_gate_max_retries.")
     parser.add_argument("--latent_gate_max_retries", type=int, default=10,
                         help="Max additional retries after try 0 for sequential_threshold policy "
                              "(total max samples = 1 + latent_gate_max_retries; default: 10)")
-    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_residual_tf_simplified_v1"],
+    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_gating"],
                         default="wiener_residual",
                         help="Mid-step scoring function: 'wiener_residual' (default) uses static median noise; "
                              "'wiener_tf' uses IMCRA adaptive noise tracking on model-domain PY (no waveform conversion); "
                              "'omlsa_residual' converts latent to audio and applies full OMLSA scoring; "
                              "'omlsa_residual_tf' applies full OMLSA scoring directly on xt_mean in TF domain "
                              "(no waveform conversion; requires y_PY cached from model input); "
-                             "'omlsa_residual_tf_simplified_v1' same backbone, simplified score: (noise_excess + λ·speech_resid) / speech_keep.")
+                             "'omlsa_gating' same backbone, simplified score: residual-noise / preserved-speech energy ratio.")
     parser.add_argument("--latent_gate_save_latents", type=str, default=None,
                         metavar="DIR",
                         help="If set, save per-file latent cache (PX, PY as .npz) to DIR after try 0. "
@@ -949,7 +976,7 @@ if __name__ == '__main__':
                 _lg_cache["T_orig"]      = T_orig
                 _lg_cache["norm_factor"] = norm_factor
                 _lg_cache["y_np"]        = y.squeeze().cpu().numpy()
-            elif args.latent_gate_score in ("omlsa_residual_tf", "omlsa_residual_tf_simplified_v1", "wiener_tf"):
+            elif args.latent_gate_score in ("omlsa_residual_tf", "omlsa_gating", "wiener_tf"):
                 # Option A: use the model-domain noisy power spectrum directly.
                 # Y[0] is [C, F, T_spec]; sum over channels → [F, T_spec].
                 # This is the exact same TF grid as xt_mean, so no STFT mismatch.

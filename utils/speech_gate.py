@@ -1031,25 +1031,16 @@ def _omlsa_residual_tf_score(PY: np.ndarray, PX: np.ndarray, eps: float = 1e-10)
     return min(float(score), MAX_SCORE)
 
 
-def _omlsa_residual_tf_simplified_v1_score(
+
+def _omlsa_gating_score(
     PY: np.ndarray,
     PX: np.ndarray,
     eps: float = 1e-10,
 ) -> float:
-    """Simplified-v1 variant of _omlsa_residual_tf_score. Lower = better.
+    """OMLSA/IMCRA gating score. Higher = better.
 
-    Identical OM-LSA/IMCRA backbone (noise tracking, gamma, eta, v, q, PH1,
-    GH1, GH0).  Only the final score differs:
-
-        numerator   = Σ_ℓ [ noise_excess(ℓ) + lambda_speech_resid · speech_resid(ℓ) ]
-        denominator = Σ_ℓ [ speech_keep(ℓ) ] + ε
-
-    where per frame:
-        noise_excess = Σ_f (1 - PH1) · X²          — energy in likely-noise bins
-        speech_resid = Σ_f PH1 · min(X², λ_d)      — speech bins near noise floor
-        speech_keep  = Σ_f PH1 · X²                — preserved speech energy (normalizer)
-
-    Tune lambda_speech_resid below alongside the other score weights.
+    IMCRA noise tracking on PY → PH1 (speech-presence probability per TF bin).
+    Score = Σ PH1·X² / Σ (1-PH1)·X²  (speech energy / noise energy in PX).
     """
     import numpy as np
     from scipy.special import exp1
@@ -1057,7 +1048,6 @@ def _omlsa_residual_tf_simplified_v1_score(
     EPS = eps
     MAX_SCORE = 1e6
 
-    # Align shapes
     M21 = min(PY.shape[0], PX.shape[0])
     n_frames = min(PY.shape[1], PX.shape[1])
     PY = np.asarray(PY[:M21, :n_frames], dtype=np.float32)
@@ -1066,115 +1056,36 @@ def _omlsa_residual_tf_simplified_v1_score(
     if n_frames < 2:
         return MAX_SCORE
 
-    # Infer n_fft from F bins (assumes real-FFT: n_fft = 2*(F-1))
-    M   = 2 * (M21 - 1)
-    Fs  = 16000.0
+    M  = 2 * (M21 - 1)
+    Fs = 16000.0
 
-    # ===== Cohen / OM-LSA params (identical to _omlsa_residual_score) =====
-    w = 1
-    alpha_s_ref = 0.9
-    Nwin = 8
-    Vwin = 15
-    delta_s = 1.67
-    Bmin = 1.66
-    delta_y = 4.6
-    delta_yt = 3.0
-    alpha_d_long = 0.99
-
-    alpha_xi_ref = 0.7
-    w_xi_local = 1
-    w_xi_global = 15
-    f_u = 10000.0
-    f_l = 50.0
-    P_min = 0.005
-    xi_lu_dB = -5.0
-    xi_ll_dB = -10.0
-    xi_gu_dB = -5.0
-    xi_gl_dB = -10.0
-    xi_fu_dB = -5.0
-    xi_fl_dB = -10.0
-    xi_mu_dB = 10.0
-    xi_ml_dB = 0.0
-    q_max = 0.998
-
-    alpha_eta_ref = 0.95
-    eta_min_dB = -18.0
-
-    # --- Dataset-dependent parameters ---
-    # Switch the active block to match your evaluation domain.
-    #
-    # VoiceBank-DEMAND (in-domain, near-stationary additive noise):
-    #   slow noise tracker is sufficient; tonal detection catches real speech
-    #   harmonics; lower noise floor is appropriate for mild noise levels.
-    # alpha_d_ref = 0.85   # slow tracker — noise is nearly stationary
-    # broad_flag  = True
-    # tone_flag   = True   # speech harmonics are real; tonal flag is meaningful
-    # nonstat     = "medium"  # lambda_d = 1.4685 * lambda_dav
-    # FRAME_BOOST    = 0.75
-    # W_SPEECH_RESID = 0.70
-    # W_NOISE_EXCESS = 1.00
-    # W_SPEECH_HOLE  = 0.18
-    # W_TONAL        = 0.35
-    #
-    # DNS-noreverb (cross-domain, non-stationary / music / babble noise):
-    #   faster tracker needed because DNS noise changes rapidly; music/harmonic
-    #   noise misfires the tonal detector so it is disabled; higher noise floor
-    #   (nonstat="high") is more conservative and suits energetic DNS noise;
-    #   upweight W_NOISE_EXCESS since leakage is the primary failure mode here.
-    alpha_d_ref = 0.70   # faster tracker — DNS noise is non-stationary
-    broad_flag  = True
-    tone_flag   = False  # music/harmonic noise falsely triggers tonal detection
-    nonstat     = "high" # lambda_d = 2.0 * lambda_dav — more conservative floor
-
-    alpha_s   = alpha_s_ref
-    alpha_d   = alpha_d_ref
-    alpha_eta = alpha_eta_ref
-    alpha_xi  = alpha_xi_ref
-
-
-    # op3- demand optimized
-    # ===== DEMAND-oriented preset =====
-    w = 1
-    alpha_s_ref = 0.82          # was 0.9
-    Nwin = 6                    # was 8
-    Vwin = 8                    # was 15
-    delta_s = 1.45              # was 1.67
-    Bmin = 1.66
-    delta_y = 3.2               # was 4.6
-    delta_yt = 2.2              # was 3.0
-    alpha_d_ref = 0.72          # was 0.85
-    alpha_d_long = 0.96         # was 0.99
-
-    alpha_xi_ref = 0.55         # was 0.7
-    w_xi_local = 1
-    w_xi_global = 9             # was 15
-    f_u = 8000.0                # was 10000.0
-    f_l = 80.0                  # was 50.0
-    P_min = 0.02                # was 0.005
-    xi_lu_dB = -4.0             # was -5
-    xi_ll_dB = -9.0             # was -10
-    xi_gu_dB = -4.0             # was -5
-    xi_gl_dB = -9.0             # was -10
-    xi_fu_dB = -4.0             # was -5
-    xi_fl_dB = -9.0             # was -10
-    xi_mu_dB = 8.0              # was 10
-    xi_ml_dB = -1.0             # was 0
-    q_max = 0.992               # was 0.998
-
-    alpha_eta_ref = 0.90        # was 0.95
-    eta_min_dB = -16.0          # was -18.0
-
-    broad_flag = True
-    tone_flag = False           # was True
-    nonstat = "high"            # was "medium"
-
-    # ===== Simplified-v1 score weight =====
-    lambda_speech_resid = 0.5   # 0.0 = pure noise-excess; 1.0 = stronger floor penalty
-    # ===== DEMAND-oriented preset end =====
-
-
-    eta_min = 10.0 ** (eta_min_dB / 10.0)
-    G_f     = eta_min ** 0.5
+    # ===== Parameters (DEMAND-optimized preset) =====
+    w           = 1
+    alpha_s     = 0.9     # spectral smoothing — from original block, before DEMAND override
+    alpha_d     = 0.70    # noise update rate  — from original block, before DEMAND override
+    alpha_eta   = 0.95    # a priori SNR smoothing — from original block
+    alpha_xi    = 0.7     # xi smoothing — from original block
+    Nwin        = 6
+    Vwin        = 8
+    delta_s     = 1.45
+    Bmin        = 1.66
+    delta_y     = 3.2
+    delta_yt    = 2.2
+    w_xi_local  = 1
+    w_xi_global = 9
+    f_u         = 8000.0
+    f_l         = 80.0
+    P_min       = 0.02
+    xi_lu_dB    = -4.0
+    xi_ll_dB    = -9.0
+    xi_gu_dB    = -4.0
+    xi_gl_dB    = -9.0
+    xi_fu_dB    = -4.0
+    xi_fl_dB    = -9.0
+    xi_mu_dB    = 8.0
+    xi_ml_dB    = -1.0
+    q_max       = 0.992
+    eta_min     = 10.0 ** (-16.0 / 10.0)
 
     # ===== Smoothing kernels =====
     b = np.hanning(2 * w + 1).astype(np.float32)
@@ -1187,17 +1098,12 @@ def _omlsa_residual_tf_simplified_v1_score(
     b_xi_global /= np.sum(b_xi_global)
 
     # ===== Frequency ranges =====
-    k_u = int(round(f_u / Fs * M + 1))
-    k_l = int(round(f_l / Fs * M + 1))
-    k_u = min(k_u, M21)
-    k_l = max(1, min(k_l, M21 - 1))
+    k_u = min(int(round(f_u / Fs * M + 1)), M21)
+    k_l = max(1, min(int(round(f_l / Fs * M + 1)), M21 - 1))
 
-    k2_local = int(round(500.0 / Fs * M + 1))
-    k3_local = int(round(3500.0 / Fs * M + 1))
-    k2_local = max(1, min(k2_local, M21 - 1))
-    k3_local = max(k2_local + 1, min(k3_local, M21 - 1))
+    k2_local = max(1, min(int(round(500.0 / Fs * M + 1)), M21 - 1))
+    k3_local = max(k2_local + 1, min(int(round(3500.0 / Fs * M + 1)), M21 - 1))
 
-    # ===== Helpers =====
     def _conv_same(x: np.ndarray, h: np.ndarray) -> np.ndarray:
         return np.convolve(x, h, mode="same")
 
@@ -1212,22 +1118,20 @@ def _omlsa_residual_tf_simplified_v1_score(
     eta_2term = np.ones(M21, dtype=np.float32)
     xi = np.zeros(M21, dtype=np.float32)
     xi_frame = 0.0
-    xi_m_dB = xi_ml_dB       # running P_frame reference level
+    xi_m_dB = xi_ml_dB
     l_mod_lswitch = 0
 
     lambda_d = np.maximum(PY[:, 0].copy(), EPS)
-    Sy = PY[:, 0].copy()
     Sf0 = _conv_same(PY[:, 0], b)
     S = Sf0.copy()
     St = Sf0.copy()
     lambda_dav = PY[:, 0].copy()
-    lambda_dav_long = PY[:, 0].copy()
     Smin = S.copy()
     SMact = S.copy()
     Smint = St.copy()
     SMactt = St.copy()
 
-    SW = np.tile(S[:, None], (1, Nwin))
+    SW  = np.tile(S[:, None],  (1, Nwin))
     SWt = np.tile(St[:, None], (1, Nwin))
 
     score_num = 0.0
@@ -1242,7 +1146,6 @@ def _omlsa_residual_tf_simplified_v1_score(
         eta = np.maximum(eta, eta_min)
         v = gamma * eta / (1.0 + eta)
 
-        # 2.1 frequency smoothing
         Sf = _conv_same(Ya2, b)
 
         if l == 0:
@@ -1253,8 +1156,6 @@ def _omlsa_residual_tf_simplified_v1_score(
             Smint = St.copy()
             SMactt = St.copy()
             lambda_dav = Ya2.copy()
-            lambda_dav_long = Ya2.copy()
-            Sy = Ya2.copy()
         else:
             S = alpha_s * S + (1.0 - alpha_s) * Sf
             if l < 14:
@@ -1264,7 +1165,6 @@ def _omlsa_residual_tf_simplified_v1_score(
                 Smin = np.minimum(Smin, S)
                 SMact = np.minimum(SMact, S)
 
-        # IMCRA local minima logic
         I_f = ((Ya2 < delta_y * Bmin * Smin) & (S < delta_s * Bmin * Smin)).astype(np.float32)
         conv_I = _conv_same(I_f, b)
         Sft = St.copy()
@@ -1285,12 +1185,9 @@ def _omlsa_residual_tf_simplified_v1_score(
         qhat = np.ones(M21, dtype=np.float32)
         phat = np.zeros(M21, dtype=np.float32)
 
-        if nonstat == "low":
-            gamma_mint = Ya2 / (Bmin * np.maximum(Smin, EPS))
-            zetat = S / (Bmin * np.maximum(Smin, EPS))
-        else:
-            gamma_mint = Ya2 / (Bmin * np.maximum(Smint, EPS))
-            zetat = S / (Bmin * np.maximum(Smint, EPS))
+        # nonstat="high": use Smint for local-minima reference
+        gamma_mint = Ya2 / (Bmin * np.maximum(Smint, EPS))
+        zetat = S / (Bmin * np.maximum(Smint, EPS))
 
         idx = (gamma_mint > 1.0) & (gamma_mint < delta_yt) & (zetat < delta_s)
         qhat[idx] = (delta_yt - gamma_mint[idx]) / (delta_yt - 1.0)
@@ -1305,18 +1202,11 @@ def _omlsa_residual_tf_simplified_v1_score(
         alpha_dt = alpha_d + (1.0 - alpha_d) * phat
         lambda_dav = alpha_dt * lambda_dav + (1.0 - alpha_dt) * Ya2
 
-        if l < 14:
-            lambda_dav_long = lambda_dav.copy()
-        else:
-            alpha_dt_long = alpha_d_long + (1.0 - alpha_d_long) * phat
-            lambda_dav_long = alpha_dt_long * lambda_dav_long + (1.0 - alpha_dt_long) * Ya2
-
-        # sliding minima window
         l_mod_lswitch += 1
         if l_mod_lswitch == Vwin:
             l_mod_lswitch = 0
             if l == Vwin - 1:
-                SW = np.tile(S[:, None], (1, Nwin))
+                SW  = np.tile(S[:, None],  (1, Nwin))
                 SWt = np.tile(St[:, None], (1, Nwin))
             else:
                 SW = np.concatenate([SW[:, 1:], SMact[:, None]], axis=1)
@@ -1327,13 +1217,9 @@ def _omlsa_residual_tf_simplified_v1_score(
                 Smint = np.min(SWt, axis=1)
                 SMactt = St.copy()
 
-        if nonstat == "high":
-            lambda_d = 2.0 * lambda_dav
-        else:
-            lambda_d = 1.4685 * lambda_dav
-        lambda_d = np.maximum(lambda_d, EPS)
+        # nonstat="high": lambda_d = 2 * lambda_dav
+        lambda_d = np.maximum(2.0 * lambda_dav, EPS)
 
-        # ===== A priori probability of signal absence =====
         xi = alpha_xi * xi + (1.0 - alpha_xi) * eta
         xi_local  = _conv_same(xi, b_xi_local)
         xi_global = _conv_same(xi, b_xi_global)
@@ -1351,26 +1237,10 @@ def _omlsa_residual_tf_simplified_v1_score(
 
         lo = min(3, M21 - 1)
         hi = min(k2_local + k3_local - 3, M21)
-        if hi > lo:
-            m_P_local = float(np.mean(P_local[lo:hi]))
-        else:
-            m_P_local = float(np.mean(P_local))
-
-        tonal_mask = np.zeros(M21, dtype=np.float32)
+        m_P_local = float(np.mean(P_local[lo:hi])) if hi > lo else float(np.mean(P_local))
 
         if m_P_local < 0.25:
             P_local[k2_local:k3_local] = P_min
-
-        if tone_flag and (m_P_local < 0.5) and (l > 120) and M21 > 16:
-            lhs = lambda_dav_long[7:(M21 - 8)]
-            rhs = 2.5 * (
-                lambda_dav_long[9:(M21 - 6)] + lambda_dav_long[5:(M21 - 10)]
-            )
-            tonal_idx = np.where(lhs > rhs)[0] + 6
-            tonal_idx = tonal_idx[(tonal_idx >= 0) & (tonal_idx < M21)]
-            if tonal_idx.size > 0:
-                P_local[tonal_idx] = P_min
-                tonal_mask[tonal_idx] = 1.0
 
         if xi_frame_dB <= xi_fl_dB:
             P_frame = P_min
@@ -1386,11 +1256,8 @@ def _omlsa_residual_tf_simplified_v1_score(
                 (xi_frame_dB - xi_m_dB - xi_fl_dB) / (xi_fu_dB - xi_fl_dB)
             ) * (1.0 - P_min)
 
-        if broad_flag:
-            q = 1.0 - P_global * P_local * P_frame
-        else:
-            q = 1.0 - P_local * P_frame
-        q = np.minimum(q, q_max)
+        # broad_flag=True: q uses P_global * P_local * P_frame
+        q = np.minimum(1.0 - P_global * P_local * P_frame, q_max)
 
         gamma = Ya2 / np.maximum(lambda_d, EPS)
         eta = alpha_eta * eta_2term + (1.0 - alpha_eta) * np.maximum(gamma - 1.0, 0.0)
@@ -1406,468 +1273,23 @@ def _omlsa_residual_tf_simplified_v1_score(
             * np.exp(-v[idx])
         )
 
-        # ===== Spectral gains =====
         GH1 = np.ones(M21, dtype=np.float32)
         idx_hi = v > 5.0
         GH1[idx_hi] = eta[idx_hi] / (1.0 + eta[idx_hi])
-
         idx_mid = (v > 0.0) & (v <= 5.0)
         if np.any(idx_mid):
             vv = np.maximum(v[idx_mid], 1e-8)
-            GH1[idx_mid] = (
-                eta[idx_mid] / (1.0 + eta[idx_mid]) * np.exp(0.5 * exp1(vv))
-            )
+            GH1[idx_mid] = eta[idx_mid] / (1.0 + eta[idx_mid]) * np.exp(0.5 * exp1(vv))
 
-        if tone_flag:
-            lambda_d_global = lambda_d.copy()
-            if M21 > 6:
-                tmp = lambda_d_global.copy()
-                tmp[3:(M21 - 3)] = np.minimum.reduce([
-                    lambda_d_global[3:(M21 - 3)],
-                    lambda_d_global[0:(M21 - 6)],
-                    lambda_d_global[6:M21],
-                ])
-                lambda_d_global = tmp
-
-            Sy = 0.8 * Sy + 0.2 * Ya2
-            GH0 = G_f * np.sqrt(lambda_d_global / np.maximum(Sy, EPS))
-        else:
-            GH0 = np.full(M21, G_f, dtype=np.float32)
-
-        G = (GH1 ** PH1) * (GH0 ** (1.0 - PH1))  # noqa: F841
         eta_2term = (GH1 ** 2) * gamma
 
-        # ===== Simplified-v1 Score =====
-        # numerator:   noise-bin energy  +  λ · speech bins near noise floor
-        # denominator: preserved speech energy
-        target_floor = np.maximum(lambda_d, EPS)
-
-        noise_excess = np.sum((1.0 - PH1) * X2)
-        speech_resid = np.sum(PH1 * np.minimum(X2, target_floor))
-        speech_keep  = np.sum(PH1 * X2)
-
-        score_num += float(noise_excess + lambda_speech_resid * speech_resid)
-        score_den += float(speech_keep + EPS)
+        score_num += float(np.sum(PH1 * X2))
+        score_den += float(np.sum((1.0 - PH1) * X2))
 
     score = score_num / (score_den + EPS)
     if not np.isfinite(score):
-        return MAX_SCORE
-    return min(float(score), MAX_SCORE)
-
-
-def _omlsa_residual_tf_simplified_v2_score(
-    PY: np.ndarray,
-    PX: np.ndarray,
-    eps: float = 1e-10,
-) -> float:
-    """Simplified-v2 variant of _omlsa_residual_tf_score. Lower = better.
-
-    Identical OM-LSA/IMCRA backbone (noise tracking, gamma, eta, v, q, PH1,
-    GH1, GH0).  Simplest possible score:
-
-        score = Σ_{k,ℓ} (1 - PH1(k,ℓ)) · X²(k,ℓ)
-                ─────────────────────────────────────
-                Σ_{k,ℓ}    PH1(k,ℓ)  · X²(k,ℓ) + ε
-
-    numerator  = residual energy in TF bins likely to be noise
-    denominator = preserved energy in TF bins likely to be speech
-    """
-    import numpy as np
-    from scipy.special import exp1
-
-    EPS = eps
-    MAX_SCORE = 1e6
-
-    # Align shapes
-    M21 = min(PY.shape[0], PX.shape[0])
-    n_frames = min(PY.shape[1], PX.shape[1])
-    PY = np.asarray(PY[:M21, :n_frames], dtype=np.float32)
-    PX = np.asarray(PX[:M21, :n_frames], dtype=np.float32)
-
-    if n_frames < 2:
-        return MAX_SCORE
-
-    # Infer n_fft from F bins (assumes real-FFT: n_fft = 2*(F-1))
-    M   = 2 * (M21 - 1)
-    Fs  = 16000.0
-
-    # ===== Cohen / OM-LSA params (identical to _omlsa_residual_score) =====
-    w = 1
-    alpha_s_ref = 0.9
-    Nwin = 8
-    Vwin = 15
-    delta_s = 1.67
-    Bmin = 1.66
-    delta_y = 4.6
-    delta_yt = 3.0
-    alpha_d_long = 0.99
-
-    alpha_xi_ref = 0.7
-    w_xi_local = 1
-    w_xi_global = 15
-    f_u = 10000.0
-    f_l = 50.0
-    P_min = 0.005
-    xi_lu_dB = -5.0
-    xi_ll_dB = -10.0
-    xi_gu_dB = -5.0
-    xi_gl_dB = -10.0
-    xi_fu_dB = -5.0
-    xi_fl_dB = -10.0
-    xi_mu_dB = 10.0
-    xi_ml_dB = 0.0
-    q_max = 0.998
-
-    alpha_eta_ref = 0.95
-    eta_min_dB = -18.0
-
-    # --- Dataset-dependent parameters ---
-    # Switch the active block to match your evaluation domain.
-    #
-    # VoiceBank-DEMAND (in-domain, near-stationary additive noise):
-    #   slow noise tracker is sufficient; tonal detection catches real speech
-    #   harmonics; lower noise floor is appropriate for mild noise levels.
-    # alpha_d_ref = 0.85   # slow tracker — noise is nearly stationary
-    # broad_flag  = True
-    # tone_flag   = True   # speech harmonics are real; tonal flag is meaningful
-    # nonstat     = "medium"  # lambda_d = 1.4685 * lambda_dav
-    # FRAME_BOOST    = 0.75
-    # W_SPEECH_RESID = 0.70
-    # W_NOISE_EXCESS = 1.00
-    # W_SPEECH_HOLE  = 0.18
-    # W_TONAL        = 0.35
-    #
-    # DNS-noreverb (cross-domain, non-stationary / music / babble noise):
-    #   faster tracker needed because DNS noise changes rapidly; music/harmonic
-    #   noise misfires the tonal detector so it is disabled; higher noise floor
-    #   (nonstat="high") is more conservative and suits energetic DNS noise;
-    #   upweight W_NOISE_EXCESS since leakage is the primary failure mode here.
-    alpha_d_ref = 0.70   # faster tracker — DNS noise is non-stationary
-    broad_flag  = True
-    tone_flag   = False  # music/harmonic noise falsely triggers tonal detection
-    nonstat     = "high" # lambda_d = 2.0 * lambda_dav — more conservative floor
-
-    alpha_s   = alpha_s_ref
-    alpha_d   = alpha_d_ref
-    alpha_eta = alpha_eta_ref
-    alpha_xi  = alpha_xi_ref
-
-
-    # op3- demand optimized
-    # ===== DEMAND-oriented preset =====
-    w = 1
-    alpha_s_ref = 0.82          # was 0.9
-    Nwin = 6                    # was 8
-    Vwin = 8                    # was 15
-    delta_s = 1.45              # was 1.67
-    Bmin = 1.66
-    delta_y = 3.2               # was 4.6
-    delta_yt = 2.2              # was 3.0
-    alpha_d_ref = 0.72          # was 0.85
-    alpha_d_long = 0.96         # was 0.99
-
-    alpha_xi_ref = 0.55         # was 0.7
-    w_xi_local = 1
-    w_xi_global = 9             # was 15
-    f_u = 8000.0                # was 10000.0
-    f_l = 80.0                  # was 50.0
-    P_min = 0.02                # was 0.005
-    xi_lu_dB = -4.0             # was -5
-    xi_ll_dB = -9.0             # was -10
-    xi_gu_dB = -4.0             # was -5
-    xi_gl_dB = -9.0             # was -10
-    xi_fu_dB = -4.0             # was -5
-    xi_fl_dB = -9.0             # was -10
-    xi_mu_dB = 8.0              # was 10
-    xi_ml_dB = -1.0             # was 0
-    q_max = 0.992               # was 0.998
-
-    alpha_eta_ref = 0.90        # was 0.95
-    eta_min_dB = -16.0          # was -18.0
-
-    broad_flag = True
-    tone_flag = False           # was True
-    nonstat = "high"            # was "medium"
-    # ===== DEMAND-oriented preset end =====
-
-
-    eta_min = 10.0 ** (eta_min_dB / 10.0)
-    G_f     = eta_min ** 0.5
-
-    # ===== Smoothing kernels =====
-    b = np.hanning(2 * w + 1).astype(np.float32)
-    b /= np.sum(b)
-
-    b_xi_local = np.hanning(2 * w_xi_local + 1).astype(np.float32)
-    b_xi_local /= np.sum(b_xi_local)
-
-    b_xi_global = np.hanning(2 * w_xi_global + 1).astype(np.float32)
-    b_xi_global /= np.sum(b_xi_global)
-
-    # ===== Frequency ranges =====
-    k_u = int(round(f_u / Fs * M + 1))
-    k_l = int(round(f_l / Fs * M + 1))
-    k_u = min(k_u, M21)
-    k_l = max(1, min(k_l, M21 - 1))
-
-    k2_local = int(round(500.0 / Fs * M + 1))
-    k3_local = int(round(3500.0 / Fs * M + 1))
-    k2_local = max(1, min(k2_local, M21 - 1))
-    k3_local = max(k2_local + 1, min(k3_local, M21 - 1))
-
-    # ===== Helpers =====
-    def _conv_same(x: np.ndarray, h: np.ndarray) -> np.ndarray:
-        return np.convolve(x, h, mode="same")
-
-    def _db_prob(x_db: np.ndarray, lo: float, hi: float, pmin: float) -> np.ndarray:
-        out = np.ones_like(x_db, dtype=np.float32)
-        out[x_db <= lo] = pmin
-        mid = (x_db > lo) & (x_db < hi)
-        out[mid] = pmin + (x_db[mid] - lo) / (hi - lo) * (1.0 - pmin)
-        return out
-
-    # ===== Initial state =====
-    eta_2term = np.ones(M21, dtype=np.float32)
-    xi = np.zeros(M21, dtype=np.float32)
-    xi_frame = 0.0
-    xi_m_dB = xi_ml_dB       # running P_frame reference level
-    l_mod_lswitch = 0
-
-    lambda_d = np.maximum(PY[:, 0].copy(), EPS)
-    Sy = PY[:, 0].copy()
-    Sf0 = _conv_same(PY[:, 0], b)
-    S = Sf0.copy()
-    St = Sf0.copy()
-    lambda_dav = PY[:, 0].copy()
-    lambda_dav_long = PY[:, 0].copy()
-    Smin = S.copy()
-    SMact = S.copy()
-    Smint = St.copy()
-    SMactt = St.copy()
-
-    SW = np.tile(S[:, None], (1, Nwin))
-    SWt = np.tile(St[:, None], (1, Nwin))
-
-    score_num = 0.0
-    score_den = 0.0
-
-    for l in range(n_frames):
-        Ya2 = np.maximum(PY[:, l], EPS)
-        X2  = np.maximum(PX[:, l], 0.0)
-
-        gamma = Ya2 / np.maximum(lambda_d, EPS)
-        eta = alpha_eta * eta_2term + (1.0 - alpha_eta) * np.maximum(gamma - 1.0, 0.0)
-        eta = np.maximum(eta, eta_min)
-        v = gamma * eta / (1.0 + eta)
-
-        # 2.1 frequency smoothing
-        Sf = _conv_same(Ya2, b)
-
-        if l == 0:
-            S = Sf.copy()
-            St = Sf.copy()
-            Smin = S.copy()
-            SMact = S.copy()
-            Smint = St.copy()
-            SMactt = St.copy()
-            lambda_dav = Ya2.copy()
-            lambda_dav_long = Ya2.copy()
-            Sy = Ya2.copy()
-        else:
-            S = alpha_s * S + (1.0 - alpha_s) * Sf
-            if l < 14:
-                Smin = S.copy()
-                SMact = S.copy()
-            else:
-                Smin = np.minimum(Smin, S)
-                SMact = np.minimum(SMact, S)
-
-        # IMCRA local minima logic
-        I_f = ((Ya2 < delta_y * Bmin * Smin) & (S < delta_s * Bmin * Smin)).astype(np.float32)
-        conv_I = _conv_same(I_f, b)
-        Sft = St.copy()
-        idx = conv_I > 0
-        if np.any(idx):
-            conv_Y = _conv_same(I_f * Ya2, b)
-            Sft[idx] = conv_Y[idx] / np.maximum(conv_I[idx], EPS)
-
-        if l < 14:
-            St = S.copy()
-            Smint = St.copy()
-            SMactt = St.copy()
-        else:
-            St = alpha_s * St + (1.0 - alpha_s) * Sft
-            Smint = np.minimum(Smint, St)
-            SMactt = np.minimum(SMactt, St)
-
-        qhat = np.ones(M21, dtype=np.float32)
-        phat = np.zeros(M21, dtype=np.float32)
-
-        if nonstat == "low":
-            gamma_mint = Ya2 / (Bmin * np.maximum(Smin, EPS))
-            zetat = S / (Bmin * np.maximum(Smin, EPS))
-        else:
-            gamma_mint = Ya2 / (Bmin * np.maximum(Smint, EPS))
-            zetat = S / (Bmin * np.maximum(Smint, EPS))
-
-        idx = (gamma_mint > 1.0) & (gamma_mint < delta_yt) & (zetat < delta_s)
-        qhat[idx] = (delta_yt - gamma_mint[idx]) / (delta_yt - 1.0)
-        phat[idx] = 1.0 / (
-            1.0
-            + qhat[idx] / np.maximum(1.0 - qhat[idx], EPS)
-            * (1.0 + eta[idx])
-            * np.exp(-v[idx])
-        )
-        phat[(gamma_mint >= delta_yt) | (zetat >= delta_s)] = 1.0
-
-        alpha_dt = alpha_d + (1.0 - alpha_d) * phat
-        lambda_dav = alpha_dt * lambda_dav + (1.0 - alpha_dt) * Ya2
-
-        if l < 14:
-            lambda_dav_long = lambda_dav.copy()
-        else:
-            alpha_dt_long = alpha_d_long + (1.0 - alpha_d_long) * phat
-            lambda_dav_long = alpha_dt_long * lambda_dav_long + (1.0 - alpha_dt_long) * Ya2
-
-        # sliding minima window
-        l_mod_lswitch += 1
-        if l_mod_lswitch == Vwin:
-            l_mod_lswitch = 0
-            if l == Vwin - 1:
-                SW = np.tile(S[:, None], (1, Nwin))
-                SWt = np.tile(St[:, None], (1, Nwin))
-            else:
-                SW = np.concatenate([SW[:, 1:], SMact[:, None]], axis=1)
-                Smin = np.min(SW, axis=1)
-                SMact = S.copy()
-
-                SWt = np.concatenate([SWt[:, 1:], SMactt[:, None]], axis=1)
-                Smint = np.min(SWt, axis=1)
-                SMactt = St.copy()
-
-        if nonstat == "high":
-            lambda_d = 2.0 * lambda_dav
-        else:
-            lambda_d = 1.4685 * lambda_dav
-        lambda_d = np.maximum(lambda_d, EPS)
-
-        # ===== A priori probability of signal absence =====
-        xi = alpha_xi * xi + (1.0 - alpha_xi) * eta
-        xi_local  = _conv_same(xi, b_xi_local)
-        xi_global = _conv_same(xi, b_xi_global)
-
-        prev_xi_frame = xi_frame
-        xi_frame  = float(np.mean(xi[k_l:k_u]))
-        dxi_frame = xi_frame - prev_xi_frame
-
-        xi_local_dB  = 10.0 * np.log10(np.maximum(xi_local,  1e-10))
-        xi_global_dB = 10.0 * np.log10(np.maximum(xi_global, 1e-10))
-        xi_frame_dB  = 10.0 * np.log10(max(xi_frame, 1e-10))
-
-        P_local  = _db_prob(xi_local_dB,  xi_ll_dB, xi_lu_dB, P_min)
-        P_global = _db_prob(xi_global_dB, xi_gl_dB, xi_gu_dB, P_min)
-
-        lo = min(3, M21 - 1)
-        hi = min(k2_local + k3_local - 3, M21)
-        if hi > lo:
-            m_P_local = float(np.mean(P_local[lo:hi]))
-        else:
-            m_P_local = float(np.mean(P_local))
-
-        tonal_mask = np.zeros(M21, dtype=np.float32)
-
-        if m_P_local < 0.25:
-            P_local[k2_local:k3_local] = P_min
-
-        if tone_flag and (m_P_local < 0.5) and (l > 120) and M21 > 16:
-            lhs = lambda_dav_long[7:(M21 - 8)]
-            rhs = 2.5 * (
-                lambda_dav_long[9:(M21 - 6)] + lambda_dav_long[5:(M21 - 10)]
-            )
-            tonal_idx = np.where(lhs > rhs)[0] + 6
-            tonal_idx = tonal_idx[(tonal_idx >= 0) & (tonal_idx < M21)]
-            if tonal_idx.size > 0:
-                P_local[tonal_idx] = P_min
-                tonal_mask[tonal_idx] = 1.0
-
-        if xi_frame_dB <= xi_fl_dB:
-            P_frame = P_min
-        elif dxi_frame >= 0:
-            xi_m_dB = min(max(xi_frame_dB, xi_ml_dB), xi_mu_dB)
-            P_frame = 1.0
-        elif xi_frame_dB >= xi_m_dB + xi_fu_dB:
-            P_frame = 1.0
-        elif xi_frame_dB <= xi_m_dB + xi_fl_dB:
-            P_frame = P_min
-        else:
-            P_frame = P_min + (
-                (xi_frame_dB - xi_m_dB - xi_fl_dB) / (xi_fu_dB - xi_fl_dB)
-            ) * (1.0 - P_min)
-
-        if broad_flag:
-            q = 1.0 - P_global * P_local * P_frame
-        else:
-            q = 1.0 - P_local * P_frame
-        q = np.minimum(q, q_max)
-
-        gamma = Ya2 / np.maximum(lambda_d, EPS)
-        eta = alpha_eta * eta_2term + (1.0 - alpha_eta) * np.maximum(gamma - 1.0, 0.0)
-        eta = np.maximum(eta, eta_min)
-        v = gamma * eta / (1.0 + eta)
-
-        PH1 = np.zeros(M21, dtype=np.float32)
-        idx = q < 0.9
-        PH1[idx] = 1.0 / (
-            1.0
-            + q[idx] / np.maximum(1.0 - q[idx], EPS)
-            * (1.0 + eta[idx])
-            * np.exp(-v[idx])
-        )
-
-        # ===== Spectral gains =====
-        GH1 = np.ones(M21, dtype=np.float32)
-        idx_hi = v > 5.0
-        GH1[idx_hi] = eta[idx_hi] / (1.0 + eta[idx_hi])
-
-        idx_mid = (v > 0.0) & (v <= 5.0)
-        if np.any(idx_mid):
-            vv = np.maximum(v[idx_mid], 1e-8)
-            GH1[idx_mid] = (
-                eta[idx_mid] / (1.0 + eta[idx_mid]) * np.exp(0.5 * exp1(vv))
-            )
-
-        if tone_flag:
-            lambda_d_global = lambda_d.copy()
-            if M21 > 6:
-                tmp = lambda_d_global.copy()
-                tmp[3:(M21 - 3)] = np.minimum.reduce([
-                    lambda_d_global[3:(M21 - 3)],
-                    lambda_d_global[0:(M21 - 6)],
-                    lambda_d_global[6:M21],
-                ])
-                lambda_d_global = tmp
-
-            Sy = 0.8 * Sy + 0.2 * Ya2
-            GH0 = G_f * np.sqrt(lambda_d_global / np.maximum(Sy, EPS))
-        else:
-            GH0 = np.full(M21, G_f, dtype=np.float32)
-
-        G = (GH1 ** PH1) * (GH0 ** (1.0 - PH1))  # noqa: F841
-        eta_2term = (GH1 ** 2) * gamma
-
-        # ===== Simplified-v2 Score =====
-        # numerator:   energy in likely-noise TF bins
-        # denominator: energy in likely-speech TF bins
-        noise_excess = np.sum((1.0 - PH1) * X2)
-        speech_keep  = np.sum(PH1 * X2)
-
-        score_num += float(noise_excess)
-        score_den += float(speech_keep + EPS)
-
-    score = score_num / (score_den + EPS)
-    if not np.isfinite(score):
-        return MAX_SCORE
-    return min(float(score), MAX_SCORE)
+        return 0.0
+    return float(score)
 
 
 def gate_step_omlsa_residual_tf(step_info: dict, cache: dict) -> float:
@@ -1933,10 +1355,11 @@ def gate_step_omlsa_residual_tf(step_info: dict, cache: dict) -> float:
     return _omlsa_residual_tf_score(PY, PX, eps=eps)
 
 
-def gate_step_omlsa_residual_tf_simplified_v1(step_info: dict, cache: dict) -> float:
-    """Per-step simplified-v1 OMLSA-TF gate. Same TF-domain setup as
+
+def gate_step_omlsa_gating(step_info: dict, cache: dict) -> float:
+    """Per-step simplified-v2 OMLSA-TF gate. Same TF-domain setup as
     gate_step_omlsa_residual_tf; delegates scoring to
-    _omlsa_residual_tf_simplified_v1_score.
+    _omlsa_gating_score.
     """
     import librosa
 
@@ -1963,7 +1386,7 @@ def gate_step_omlsa_residual_tf_simplified_v1(step_info: dict, cache: dict) -> f
             cache["_py_tf_cache"] = np.abs(Y_stft) ** 2
         PY = cache["_py_tf_cache"]
 
-    return _omlsa_residual_tf_simplified_v1_score(PY, PX, eps=eps)
+    return _omlsa_gating_score(PY, PX, eps=eps)
 
 
 def gate_step_stft_leakage(step_info: dict, cache: dict) -> float:
@@ -2286,6 +1709,8 @@ def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> d
 #             scores["omlsa_residual"] = gate_step_omlsa_residual(step_info, cache)
         elif gate == "omlsa_residual_tf":
             scores["omlsa_residual_tf"] = gate_step_omlsa_residual_tf(step_info, cache)
+        elif gate == "omlsa_gating":
+            scores["omlsa_gating"] = gate_step_omlsa_gating(step_info, cache)
         elif gate == "stft_leakage":
             scores["stft_leakage"] = gate_step_stft_leakage(step_info, cache)
         elif gate == "traj_jump":
