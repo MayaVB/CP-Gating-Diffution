@@ -12,6 +12,8 @@ dns_noreverb/
 dns/
 urgent2025/
 old/
+plotting_scripts/
+additional_scripts/
 
 ### Emacs ###
 # -*- mode: gitignore; -*-
