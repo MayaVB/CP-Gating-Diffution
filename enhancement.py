@@ -386,20 +386,24 @@ def _run_adaptive_k_multilevel_sampling(
     return x_hats[chosen_try], k_target, chosen_try, d0, best_score, True
 
 
-def _save_latent_cache(save_dir, filename, xt_box, gate_cache):
+def _save_latent_cache(save_dir, filename, xt_box, gate_cache, try_idx=None):
     """Save xt_mean and PY for one utterance to a .npz file.
 
     Only runs when save_dir is set and xt_box[0] was populated.
     xt_mean = complex64 [C, F, T_spec] — full latent at the gate step.
               Sufficient to reconstruct any TF-domain score offline.
     PY      = noisy input power spectrum [F, T_spec] (from gate_cache["y_PY"])
+    try_idx : int or None — if set, appends _try{try_idx} to the stem so all
+              K tries are saved as separate files (e.g. p232_001_try0.npz).
+              None (default) keeps the original single-file naming (p232_001.npz).
     """
     if save_dir is None or xt_box is None or xt_box[0] is None:
         return
     import os
     makedirs(save_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(filename))[0] if filename else "unknown"
-    out_path = os.path.join(save_dir, f"{stem}.npz")
+    suffix = f"_try{try_idx}" if try_idx is not None else ""
+    out_path = os.path.join(save_dir, f"{stem}{suffix}.npz")
     xt_mean = xt_box[0]                       # complex64 [C, F, T_spec]
     PY = gate_cache.get("y_PY", None)
     np.savez_compressed(out_path, xt_mean=xt_mean, **({} if PY is None else {"PY": PY}))
@@ -486,6 +490,12 @@ def _run_latent_gate_sampling(
         from utils.speech_gate import gate_step_omlsa_residual_tf as _gate_fn
     elif latent_gate_score == "omlsa_gating":
         from utils.speech_gate import gate_step_omlsa_gating as _gate_fn
+    elif latent_gate_score == "omlsa_mix":
+        from utils.speech_gate import gate_step_omlsa_mix as _gate_fn
+    elif latent_gate_score == "omlsa_mask_agree":
+        from utils.speech_gate import gate_step_omlsa_mask_agree as _gate_fn
+    elif latent_gate_score == "omlsa_enhanced_dominant":
+        from utils.speech_gate import gate_step_omlsa_enhanced_dominant as _gate_fn
     else:
         raise ValueError(f"Unknown latent_gate_score: {latent_gate_score!r}")
 
@@ -571,10 +581,15 @@ def _run_latent_gate_sampling(
     # -----------------------------------------------------------------------
     # Policy: best_of_k (existing behavior)
     # -----------------------------------------------------------------------
+    # Save all tries when save_latents_dir is set (multi-try cache, _try{t} suffix).
+    # Falls back to single-file naming (no suffix) when kmax==1 for compat.
+    _save_all = save_latents_dir is not None
+    _try_suffix = 0 if _save_all and latent_gate_kmax > 1 else None
+
     # --- Try 0 (always run first) ---
-    _xt_box = [None] if save_latents_dir else None
+    _xt_box = [None] if _save_all else None
     x_hat_0, d0 = _run_try(0, _xt_box=_xt_box)
-    _save_latent_cache(save_latents_dir, save_latents_filename, _xt_box, gate_cache)
+    _save_latent_cache(save_latents_dir, save_latents_filename, _xt_box, gate_cache, try_idx=_try_suffix)
     scores     = [d0]
     best_score = d0
     best_x_hat = x_hat_0
@@ -597,7 +612,10 @@ def _run_latent_gate_sampling(
 
     # --- Run tries 1..k_target-1 ---
     for _t in range(1, k_target):
-        x_hat_t, score = _run_try(_t)
+        _xt_box_t = [None] if _save_all else None
+        x_hat_t, score = _run_try(_t, _xt_box=_xt_box_t)
+        _save_latent_cache(save_latents_dir, save_latents_filename, _xt_box_t, gate_cache,
+                           try_idx=_t if _save_all and latent_gate_kmax > 1 else None)
         scores.append(score)
         if score < best_score:
             best_score = score
@@ -676,7 +694,7 @@ if __name__ == '__main__':
     parser.add_argument("--latent_gate_max_retries", type=int, default=10,
                         help="Max additional retries after try 0 for sequential_threshold policy "
                              "(total max samples = 1 + latent_gate_max_retries; default: 10)")
-    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_gating"],
+    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_gating", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant"],
                         default="wiener_residual",
                         help="Mid-step scoring function: 'wiener_residual' (default) uses static median noise; "
                              "'wiener_tf' uses IMCRA adaptive noise tracking on model-domain PY (no waveform conversion); "
@@ -976,7 +994,7 @@ if __name__ == '__main__':
                 _lg_cache["T_orig"]      = T_orig
                 _lg_cache["norm_factor"] = norm_factor
                 _lg_cache["y_np"]        = y.squeeze().cpu().numpy()
-            elif args.latent_gate_score in ("omlsa_residual_tf", "omlsa_gating", "wiener_tf"):
+            elif args.latent_gate_score in ("omlsa_residual_tf", "omlsa_gating", "wiener_tf", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant"):
                 # Option A: use the model-domain noisy power spectrum directly.
                 # Y[0] is [C, F, T_spec]; sum over channels → [F, T_spec].
                 # This is the exact same TF grid as xt_mean, so no STFT mismatch.

@@ -1292,6 +1292,615 @@ def _omlsa_gating_score(
     return float(score)
 
 
+def _omlsa_residual_tf_mix_score(
+    PY: np.ndarray,
+    PX: np.ndarray,
+    eps: float = 1e-10,
+) -> float:
+    """OMLSA mix score. Higher = better.
+
+    # OMLSA mix score:
+    # measures how much enhanced energy remains speech-like (via PH1_X)
+    # in regions where noisy signal predicts speech (via PH1_Y)
+
+    Score = Σ PH1_Y · PH1_X · X² / (Σ PH1_Y · X² + ε)
+
+    PH1_Y: speech-presence probability from IMCRA run on PY (noisy).
+    PH1_X: speech-presence probability from IMCRA run on PX (enhanced).
+    X²   : enhanced power spectrum.
+    """
+    import numpy as np
+    from scipy.special import exp1
+
+    EPS = eps
+
+    M21 = min(PY.shape[0], PX.shape[0])
+    n_frames = min(PY.shape[1], PX.shape[1])
+    PY = np.asarray(PY[:M21, :n_frames], dtype=np.float32)
+    PX = np.asarray(PX[:M21, :n_frames], dtype=np.float32)
+
+    if n_frames < 2:
+        return 0.0
+
+    M  = 2 * (M21 - 1)
+    Fs = 16000.0
+
+    # ===== Parameters — identical to _omlsa_gating_score =====
+    w           = 1
+    alpha_s     = 0.9
+    alpha_d     = 0.70
+    alpha_eta   = 0.95
+    alpha_xi    = 0.7
+    Nwin        = 6
+    Vwin        = 8
+    delta_s     = 1.45
+    Bmin        = 1.66
+    delta_y     = 3.2
+    delta_yt    = 2.2
+    w_xi_local  = 1
+    w_xi_global = 9
+    f_u         = 8000.0
+    f_l         = 80.0
+    P_min       = 0.02
+    xi_lu_dB    = -4.0
+    xi_ll_dB    = -9.0
+    xi_gu_dB    = -4.0
+    xi_gl_dB    = -9.0
+    xi_fu_dB    = -4.0
+    xi_fl_dB    = -9.0
+    xi_mu_dB    = 8.0
+    xi_ml_dB    = -1.0
+    q_max       = 0.992
+    eta_min     = 10.0 ** (-16.0 / 10.0)
+
+    b = np.hanning(2 * w + 1).astype(np.float32)
+    b /= np.sum(b)
+    b_xi_local = np.hanning(2 * w_xi_local + 1).astype(np.float32)
+    b_xi_local /= np.sum(b_xi_local)
+    b_xi_global = np.hanning(2 * w_xi_global + 1).astype(np.float32)
+    b_xi_global /= np.sum(b_xi_global)
+
+    k_u = min(int(round(f_u / Fs * M + 1)), M21)
+    k_l = max(1, min(int(round(f_l / Fs * M + 1)), M21 - 1))
+    k2_local = max(1, min(int(round(500.0  / Fs * M + 1)), M21 - 1))
+    k3_local = max(k2_local + 1, min(int(round(3500.0 / Fs * M + 1)), M21 - 1))
+
+    def _conv_same(x: np.ndarray, h: np.ndarray) -> np.ndarray:
+        return np.convolve(x, h, mode="same")
+
+    def _db_prob(x_db: np.ndarray, lo: float, hi: float, pmin: float) -> np.ndarray:
+        out = np.ones_like(x_db, dtype=np.float32)
+        out[x_db <= lo] = pmin
+        mid = (x_db > lo) & (x_db < hi)
+        out[mid] = pmin + (x_db[mid] - lo) / (hi - lo) * (1.0 - pmin)
+        return out
+
+    def _run_imcra(P: np.ndarray) -> list:
+        """Run IMCRA backbone on P; return per-frame PH1 arrays."""
+        eta_2term = np.ones(M21, dtype=np.float32)
+        xi = np.zeros(M21, dtype=np.float32)
+        xi_frame = 0.0
+        xi_m_dB = xi_ml_dB
+        l_mod_lswitch = 0
+
+        lambda_d   = np.maximum(P[:, 0].copy(), EPS)
+        Sf0        = _conv_same(P[:, 0], b)
+        S          = Sf0.copy()
+        St         = Sf0.copy()
+        lambda_dav = P[:, 0].copy()
+        Smin       = S.copy()
+        SMact      = S.copy()
+        Smint      = St.copy()
+        SMactt     = St.copy()
+        SW         = np.tile(S[:,  None], (1, Nwin))
+        SWt        = np.tile(St[:, None], (1, Nwin))
+
+        PH1_frames = []
+
+        for l in range(n_frames):
+            Ya2 = np.maximum(P[:, l], EPS)
+
+            gamma = Ya2 / np.maximum(lambda_d, EPS)
+            eta   = alpha_eta * eta_2term + (1.0 - alpha_eta) * np.maximum(gamma - 1.0, 0.0)
+            eta   = np.maximum(eta, eta_min)
+            v     = gamma * eta / (1.0 + eta)
+
+            Sf = _conv_same(Ya2, b)
+
+            if l == 0:
+                S = Sf.copy(); St = Sf.copy()
+                Smin = S.copy(); SMact = S.copy()
+                Smint = St.copy(); SMactt = St.copy()
+                lambda_dav = Ya2.copy()
+            else:
+                S = alpha_s * S + (1.0 - alpha_s) * Sf
+                if l < 14:
+                    Smin = S.copy(); SMact = S.copy()
+                else:
+                    Smin  = np.minimum(Smin,  S)
+                    SMact = np.minimum(SMact, S)
+
+            I_f    = ((Ya2 < delta_y * Bmin * Smin) & (S < delta_s * Bmin * Smin)).astype(np.float32)
+            conv_I = _conv_same(I_f, b)
+            Sft    = St.copy()
+            idx    = conv_I > 0
+            if np.any(idx):
+                conv_Y  = _conv_same(I_f * Ya2, b)
+                Sft[idx] = conv_Y[idx] / np.maximum(conv_I[idx], EPS)
+
+            if l < 14:
+                St = S.copy(); Smint = St.copy(); SMactt = St.copy()
+            else:
+                St     = alpha_s * St + (1.0 - alpha_s) * Sft
+                Smint  = np.minimum(Smint,  St)
+                SMactt = np.minimum(SMactt, St)
+
+            qhat = np.ones(M21, dtype=np.float32)
+            phat = np.zeros(M21, dtype=np.float32)
+            gamma_mint = Ya2 / (Bmin * np.maximum(Smint, EPS))
+            zetat      = S   / (Bmin * np.maximum(Smint, EPS))
+            idx = (gamma_mint > 1.0) & (gamma_mint < delta_yt) & (zetat < delta_s)
+            qhat[idx] = (delta_yt - gamma_mint[idx]) / (delta_yt - 1.0)
+            phat[idx] = 1.0 / (
+                1.0 + qhat[idx] / np.maximum(1.0 - qhat[idx], EPS)
+                * (1.0 + eta[idx]) * np.exp(-v[idx])
+            )
+            phat[(gamma_mint >= delta_yt) | (zetat >= delta_s)] = 1.0
+
+            alpha_dt   = alpha_d + (1.0 - alpha_d) * phat
+            lambda_dav = alpha_dt * lambda_dav + (1.0 - alpha_dt) * Ya2
+
+            l_mod_lswitch += 1
+            if l_mod_lswitch == Vwin:
+                l_mod_lswitch = 0
+                if l == Vwin - 1:
+                    SW  = np.tile(S[:,  None], (1, Nwin))
+                    SWt = np.tile(St[:, None], (1, Nwin))
+                else:
+                    SW   = np.concatenate([SW[:,  1:], SMact[:,  None]], axis=1)
+                    Smin = np.min(SW, axis=1); SMact = S.copy()
+                    SWt   = np.concatenate([SWt[:, 1:], SMactt[:, None]], axis=1)
+                    Smint = np.min(SWt, axis=1); SMactt = St.copy()
+
+            lambda_d = np.maximum(2.0 * lambda_dav, EPS)
+
+            xi        = alpha_xi * xi + (1.0 - alpha_xi) * eta
+            xi_local  = _conv_same(xi, b_xi_local)
+            xi_global = _conv_same(xi, b_xi_global)
+
+            prev_xi_frame = xi_frame
+            xi_frame  = float(np.mean(xi[k_l:k_u]))
+            dxi_frame = xi_frame - prev_xi_frame
+
+            xi_local_dB  = 10.0 * np.log10(np.maximum(xi_local,  1e-10))
+            xi_global_dB = 10.0 * np.log10(np.maximum(xi_global, 1e-10))
+            xi_frame_dB  = 10.0 * np.log10(max(xi_frame, 1e-10))
+
+            P_local  = _db_prob(xi_local_dB,  xi_ll_dB, xi_lu_dB, P_min)
+            P_global = _db_prob(xi_global_dB, xi_gl_dB, xi_gu_dB, P_min)
+
+            lo = min(3, M21 - 1)
+            hi = min(k2_local + k3_local - 3, M21)
+            m_P_local = float(np.mean(P_local[lo:hi])) if hi > lo else float(np.mean(P_local))
+            if m_P_local < 0.25:
+                P_local[k2_local:k3_local] = P_min
+
+            if xi_frame_dB <= xi_fl_dB:
+                P_frame = P_min
+            elif dxi_frame >= 0:
+                xi_m_dB = min(max(xi_frame_dB, xi_ml_dB), xi_mu_dB)
+                P_frame = 1.0
+            elif xi_frame_dB >= xi_m_dB + xi_fu_dB:
+                P_frame = 1.0
+            elif xi_frame_dB <= xi_m_dB + xi_fl_dB:
+                P_frame = P_min
+            else:
+                P_frame = P_min + (
+                    (xi_frame_dB - xi_m_dB - xi_fl_dB) / (xi_fu_dB - xi_fl_dB)
+                ) * (1.0 - P_min)
+
+            q = np.minimum(1.0 - P_global * P_local * P_frame, q_max)
+
+            gamma = Ya2 / np.maximum(lambda_d, EPS)
+            eta   = alpha_eta * eta_2term + (1.0 - alpha_eta) * np.maximum(gamma - 1.0, 0.0)
+            eta   = np.maximum(eta, eta_min)
+            v     = gamma * eta / (1.0 + eta)
+
+            PH1 = np.zeros(M21, dtype=np.float32)
+            idx = q < 0.9
+            PH1[idx] = 1.0 / (
+                1.0 + q[idx] / np.maximum(1.0 - q[idx], EPS)
+                * (1.0 + eta[idx]) * np.exp(-v[idx])
+            )
+
+            GH1 = np.ones(M21, dtype=np.float32)
+            idx_hi = v > 5.0
+            GH1[idx_hi] = eta[idx_hi] / (1.0 + eta[idx_hi])
+            idx_mid = (v > 0.0) & (v <= 5.0)
+            if np.any(idx_mid):
+                vv = np.maximum(v[idx_mid], 1e-8)
+                GH1[idx_mid] = eta[idx_mid] / (1.0 + eta[idx_mid]) * np.exp(0.5 * exp1(vv))
+
+            eta_2term = (GH1 ** 2) * gamma
+            PH1_frames.append(PH1)
+
+        return PH1_frames
+
+    # Run IMCRA independently on noisy and enhanced spectra
+    PH1_Y_frames = _run_imcra(PY)
+    PH1_X_frames = _run_imcra(PX)
+
+    score_num = 0.0
+    score_den = 0.0
+    for l in range(n_frames):
+        X2    = np.maximum(PX[:, l], 0.0)
+        PH1_Y = PH1_Y_frames[l]
+        PH1_X = PH1_X_frames[l]
+        score_num += float(np.sum(PH1_Y * PH1_X * X2))
+        score_den += float(np.sum(PH1_Y * X2))
+
+    score = score_num / (score_den + EPS)
+    if not np.isfinite(score):
+        return 0.0
+    return float(score)
+
+
+def _ph1_frames_from_spectrum(P: np.ndarray, eps: float = 1e-10) -> list:
+    """Run IMCRA/OMLSA backbone on P [F, T]; return per-frame PH1 list.
+
+    Parameters identical to _omlsa_residual_tf_mix_score._run_imcra.
+    New functions should call this instead of duplicating the backbone.
+    """
+    import numpy as np
+    from scipy.special import exp1
+
+    EPS = eps
+    M21 = P.shape[0]
+    n_frames = P.shape[1]
+    M  = 2 * (M21 - 1)
+    Fs = 16000.0
+
+    w           = 1
+    alpha_s     = 0.9
+    alpha_d     = 0.70
+    alpha_eta   = 0.95
+    alpha_xi    = 0.7
+    Nwin        = 6
+    Vwin        = 8
+    delta_s     = 1.45
+    Bmin        = 1.66
+    delta_y     = 3.2
+    delta_yt    = 2.2
+    w_xi_local  = 1
+    w_xi_global = 9
+    f_u         = 8000.0
+    f_l         = 80.0
+    P_min       = 0.02
+    xi_lu_dB    = -4.0
+    xi_ll_dB    = -9.0
+    xi_gu_dB    = -4.0
+    xi_gl_dB    = -9.0
+    xi_fu_dB    = -4.0
+    xi_fl_dB    = -9.0
+    xi_mu_dB    = 8.0
+    xi_ml_dB    = -1.0
+    q_max       = 0.992
+    eta_min     = 10.0 ** (-16.0 / 10.0)
+
+    b = np.hanning(2 * w + 1).astype(np.float32);           b /= np.sum(b)
+    b_xi_local  = np.hanning(2 * w_xi_local  + 1).astype(np.float32); b_xi_local  /= np.sum(b_xi_local)
+    b_xi_global = np.hanning(2 * w_xi_global + 1).astype(np.float32); b_xi_global /= np.sum(b_xi_global)
+
+    k_u      = min(int(round(f_u    / Fs * M + 1)), M21)
+    k_l      = max(1, min(int(round(f_l    / Fs * M + 1)), M21 - 1))
+    k2_local = max(1, min(int(round(500.0  / Fs * M + 1)), M21 - 1))
+    k3_local = max(k2_local + 1, min(int(round(3500.0 / Fs * M + 1)), M21 - 1))
+
+    def _conv_same(x, h):
+        return np.convolve(x, h, mode="same")
+
+    def _db_prob(x_db, lo, hi, pmin):
+        out = np.ones_like(x_db, dtype=np.float32)
+        out[x_db <= lo] = pmin
+        mid = (x_db > lo) & (x_db < hi)
+        out[mid] = pmin + (x_db[mid] - lo) / (hi - lo) * (1.0 - pmin)
+        return out
+
+    eta_2term     = np.ones(M21, dtype=np.float32)
+    xi            = np.zeros(M21, dtype=np.float32)
+    xi_frame      = 0.0
+    xi_m_dB       = xi_ml_dB
+    l_mod_lswitch = 0
+
+    lambda_d   = np.maximum(P[:, 0].copy(), EPS)
+    Sf0        = _conv_same(P[:, 0], b)
+    S          = Sf0.copy()
+    St         = Sf0.copy()
+    lambda_dav = P[:, 0].copy()
+    Smin       = S.copy()
+    SMact      = S.copy()
+    Smint      = St.copy()
+    SMactt     = St.copy()
+    SW         = np.tile(S[:,  None], (1, Nwin))
+    SWt        = np.tile(St[:, None], (1, Nwin))
+
+    PH1_frames = []
+    for l in range(n_frames):
+        Ya2   = np.maximum(P[:, l], EPS)
+        gamma = Ya2 / np.maximum(lambda_d, EPS)
+        eta   = np.maximum(alpha_eta * eta_2term + (1.0 - alpha_eta) * np.maximum(gamma - 1.0, 0.0), eta_min)
+        v     = gamma * eta / (1.0 + eta)
+        Sf    = _conv_same(Ya2, b)
+
+        if l == 0:
+            S = Sf.copy(); St = Sf.copy()
+            Smin = S.copy(); SMact = S.copy()
+            Smint = St.copy(); SMactt = St.copy()
+            lambda_dav = Ya2.copy()
+        else:
+            S = alpha_s * S + (1.0 - alpha_s) * Sf
+            if l < 14:
+                Smin = S.copy(); SMact = S.copy()
+            else:
+                Smin  = np.minimum(Smin,  S)
+                SMact = np.minimum(SMact, S)
+
+        I_f    = ((Ya2 < delta_y * Bmin * Smin) & (S < delta_s * Bmin * Smin)).astype(np.float32)
+        conv_I = _conv_same(I_f, b)
+        Sft    = St.copy()
+        idx    = conv_I > 0
+        if np.any(idx):
+            conv_Y   = _conv_same(I_f * Ya2, b)
+            Sft[idx] = conv_Y[idx] / np.maximum(conv_I[idx], EPS)
+
+        if l < 14:
+            St = S.copy(); Smint = St.copy(); SMactt = St.copy()
+        else:
+            St     = alpha_s * St + (1.0 - alpha_s) * Sft
+            Smint  = np.minimum(Smint,  St)
+            SMactt = np.minimum(SMactt, St)
+
+        qhat = np.ones(M21, dtype=np.float32)
+        phat = np.zeros(M21, dtype=np.float32)
+        gamma_mint = Ya2 / (Bmin * np.maximum(Smint, EPS))
+        zetat      = S   / (Bmin * np.maximum(Smint, EPS))
+        idx = (gamma_mint > 1.0) & (gamma_mint < delta_yt) & (zetat < delta_s)
+        qhat[idx] = (delta_yt - gamma_mint[idx]) / (delta_yt - 1.0)
+        phat[idx] = 1.0 / (
+            1.0 + qhat[idx] / np.maximum(1.0 - qhat[idx], EPS)
+            * (1.0 + eta[idx]) * np.exp(-v[idx])
+        )
+        phat[(gamma_mint >= delta_yt) | (zetat >= delta_s)] = 1.0
+
+        alpha_dt   = alpha_d + (1.0 - alpha_d) * phat
+        lambda_dav = alpha_dt * lambda_dav + (1.0 - alpha_dt) * Ya2
+
+        l_mod_lswitch += 1
+        if l_mod_lswitch == Vwin:
+            l_mod_lswitch = 0
+            if l == Vwin - 1:
+                SW  = np.tile(S[:,  None], (1, Nwin))
+                SWt = np.tile(St[:, None], (1, Nwin))
+            else:
+                SW   = np.concatenate([SW[:,  1:], SMact[:,  None]], axis=1)
+                Smin = np.min(SW, axis=1); SMact = S.copy()
+                SWt   = np.concatenate([SWt[:, 1:], SMactt[:, None]], axis=1)
+                Smint = np.min(SWt, axis=1); SMactt = St.copy()
+
+        lambda_d = np.maximum(2.0 * lambda_dav, EPS)
+        xi        = alpha_xi * xi + (1.0 - alpha_xi) * eta
+        xi_local  = _conv_same(xi, b_xi_local)
+        xi_global = _conv_same(xi, b_xi_global)
+
+        prev_xi_frame = xi_frame
+        xi_frame      = float(np.mean(xi[k_l:k_u]))
+        dxi_frame     = xi_frame - prev_xi_frame
+
+        xi_local_dB  = 10.0 * np.log10(np.maximum(xi_local,  1e-10))
+        xi_global_dB = 10.0 * np.log10(np.maximum(xi_global, 1e-10))
+        xi_frame_dB  = 10.0 * np.log10(max(xi_frame, 1e-10))
+
+        P_local  = _db_prob(xi_local_dB,  xi_ll_dB, xi_lu_dB, P_min)
+        P_global = _db_prob(xi_global_dB, xi_gl_dB, xi_gu_dB, P_min)
+
+        lo = min(3, M21 - 1)
+        hi = min(k2_local + k3_local - 3, M21)
+        m_P_local = float(np.mean(P_local[lo:hi])) if hi > lo else float(np.mean(P_local))
+        if m_P_local < 0.25:
+            P_local[k2_local:k3_local] = P_min
+
+        if xi_frame_dB <= xi_fl_dB:
+            P_frame = P_min
+        elif dxi_frame >= 0:
+            xi_m_dB = min(max(xi_frame_dB, xi_ml_dB), xi_mu_dB)
+            P_frame = 1.0
+        elif xi_frame_dB >= xi_m_dB + xi_fu_dB:
+            P_frame = 1.0
+        elif xi_frame_dB <= xi_m_dB + xi_fl_dB:
+            P_frame = P_min
+        else:
+            P_frame = P_min + (
+                (xi_frame_dB - xi_m_dB - xi_fl_dB) / (xi_fu_dB - xi_fl_dB)
+            ) * (1.0 - P_min)
+
+        q = np.minimum(1.0 - P_global * P_local * P_frame, q_max)
+
+        gamma = Ya2 / np.maximum(lambda_d, EPS)
+        eta   = np.maximum(alpha_eta * eta_2term + (1.0 - alpha_eta) * np.maximum(gamma - 1.0, 0.0), eta_min)
+        v     = gamma * eta / (1.0 + eta)
+
+        PH1 = np.zeros(M21, dtype=np.float32)
+        idx = q < 0.9
+        PH1[idx] = 1.0 / (
+            1.0 + q[idx] / np.maximum(1.0 - q[idx], EPS)
+            * (1.0 + eta[idx]) * np.exp(-v[idx])
+        )
+
+        GH1 = np.ones(M21, dtype=np.float32)
+        idx_hi  = v > 5.0
+        GH1[idx_hi] = eta[idx_hi] / (1.0 + eta[idx_hi])
+        idx_mid = (v > 0.0) & (v <= 5.0)
+        if np.any(idx_mid):
+            vv = np.maximum(v[idx_mid], 1e-8)
+            GH1[idx_mid] = eta[idx_mid] / (1.0 + eta[idx_mid]) * np.exp(0.5 * exp1(vv))
+
+        eta_2term = (GH1 ** 2) * gamma
+        PH1_frames.append(PH1)
+
+    return PH1_frames
+
+
+def _omlsa_mask_agree_score(
+    PY: np.ndarray,
+    PX: np.ndarray,
+    eps: float = 1e-10,
+) -> float:
+    """OMLSA mask agreement score. Higher = better.
+
+    # OMLSA mask agreement score:
+    # penalizes mismatch between noisy and enhanced speech masks
+    # higher score = better agreement / cleaner enhancement
+
+    score = 1 - Σ PH1_Y * |PH1_Y - PH1_X| / (Σ PH1_Y + ε)
+
+    PH1_Y: speech-presence probability from IMCRA run on PY (noisy).
+    PH1_X: speech-presence probability from IMCRA run on PX (enhanced).
+    No X² weighting — pure mask comparison.
+    """
+    import numpy as np
+
+    M21      = min(PY.shape[0], PX.shape[0])
+    n_frames = min(PY.shape[1], PX.shape[1])
+    PY = np.asarray(PY[:M21, :n_frames], dtype=np.float32)
+    PX = np.asarray(PX[:M21, :n_frames], dtype=np.float32)
+
+    if n_frames < 2:
+        return 0.0
+
+    PH1_Y_frames = _ph1_frames_from_spectrum(PY, eps=eps)
+    PH1_X_frames = _ph1_frames_from_spectrum(PX, eps=eps)
+
+    score_num = 0.0
+    score_den = 0.0
+    for l in range(n_frames):
+        PH1_Y = PH1_Y_frames[l]
+        PH1_X = PH1_X_frames[l]
+        diff = np.abs(PH1_Y - PH1_X)
+        score_num += float(np.sum(PH1_Y * diff))
+        score_den += float(np.sum(PH1_Y))
+
+    score = 1.0 - score_num / (score_den + eps)
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _omlsa_enhanced_dominant_score(
+    PY: np.ndarray,
+    PX: np.ndarray,
+    eps: float = 1e-10,
+    lambda_noise_penalty: float = 0.25,
+) -> float:
+    """OM-LSA enhanced-dominant score. Higher = better.
+
+    Runs IMCRA independently on PX and PY to obtain PH1_X and PH1_Y.
+    Score rewards enhanced energy that looks speech-like according to PH1_X,
+    and lightly penalises enhanced energy in regions where PH1_Y says speech
+    is absent.
+
+    s = Σ PH1_X · X²  / (Σ X² + ε)
+      − λ · Σ (1−PH1_Y) · X²  / (Σ X² + ε)
+    """
+    import numpy as np
+    EPS = eps
+
+    M21      = min(PY.shape[0], PX.shape[0])
+    n_frames = min(PY.shape[1], PX.shape[1])
+    PY = np.asarray(PY[:M21, :n_frames], dtype=np.float32)
+    PX = np.asarray(PX[:M21, :n_frames], dtype=np.float32)
+
+    if n_frames < 2:
+        return 0.0
+
+    PH1_X_frames = _ph1_frames_from_spectrum(PX, eps=EPS)
+    PH1_Y_frames = _ph1_frames_from_spectrum(PY, eps=EPS)
+
+    total_energy  = 0.0
+    speech_like_x = 0.0
+    noise_leak_y  = 0.0
+
+    for l in range(n_frames):
+        X2    = np.maximum(PX[:, l], 0.0)
+        PH1_X = PH1_X_frames[l]
+        PH1_Y = PH1_Y_frames[l]
+        total_energy  += float(np.sum(X2))
+        speech_like_x += float(np.sum(PH1_X * X2))
+        noise_leak_y  += float(np.sum((1.0 - PH1_Y) * X2))
+
+    denom = total_energy + EPS
+    score = speech_like_x / denom - lambda_noise_penalty * noise_leak_y / denom
+    if not np.isfinite(score):
+        return 0.0
+    return float(score)
+
+
+def _omlsa_residual_consistency_score(
+    PY: np.ndarray,
+    PX: np.ndarray,
+    eps: float = 1e-10,
+) -> float:
+    """Residual consistency score. Higher = better.
+
+    # Residual consistency score:
+    # penalizes removing speech (via residual energy in speech regions)
+    # and leaving noise (via energy in non-speech regions)
+    # approximates SI-SDR selection behavior
+
+    Uses magnitude approximation R_mag = sqrt(PY) - sqrt(PX) since only
+    power spectra are available (no complex phase).
+
+    bad = speech_term + noise_term
+        speech_term = Σ PH1_Y · R²  / (Σ PH1_Y · Y²  + ε)
+        noise_term  = Σ (1-PH1_Y) · X²  / (Σ (1-PH1_Y) · Y²  + ε)
+    score = -bad
+    """
+    import numpy as np
+
+    M21      = min(PY.shape[0], PX.shape[0])
+    n_frames = min(PY.shape[1], PX.shape[1])
+    PY = np.asarray(PY[:M21, :n_frames], dtype=np.float32)
+    PX = np.asarray(PX[:M21, :n_frames], dtype=np.float32)
+
+    if n_frames < 2:
+        return 0.0
+
+    PH1_Y_frames = _ph1_frames_from_spectrum(PY, eps=eps)
+
+    speech_num = 0.0
+    speech_den = 0.0
+    noise_num  = 0.0
+    noise_den  = 0.0
+
+    for l in range(n_frames):
+        Y2    = PY[:, l]
+        X2    = np.maximum(PX[:, l], 0.0)
+        R2    = (np.sqrt(np.maximum(Y2, 0.0)) - np.sqrt(X2)) ** 2
+        PH1_Y = PH1_Y_frames[l]
+        w_s   = PH1_Y
+        w_n   = 1.0 - PH1_Y
+
+        speech_num += float(np.sum(w_s * R2))
+        speech_den += float(np.sum(w_s * Y2))
+        noise_num  += float(np.sum(w_n * X2))
+        noise_den  += float(np.sum(w_n * Y2))
+
+    speech_term = speech_num / (speech_den + eps)
+    noise_term  = noise_num  / (noise_den  + eps)
+    score = -(speech_term + noise_term)
+
+    if not np.isfinite(score):
+        return 0.0
+    return float(score)
+
+
 def gate_step_omlsa_residual_tf(step_info: dict, cache: dict) -> float:
     """Per-step OMLSA-TF gate — pure TF-domain, no xt_mean→waveform conversion.
 
@@ -1387,6 +1996,166 @@ def gate_step_omlsa_gating(step_info: dict, cache: dict) -> float:
         PY = cache["_py_tf_cache"]
 
     return _omlsa_gating_score(PY, PX, eps=eps)
+
+
+def gate_step_omlsa_mix(step_info: dict, cache: dict) -> float:
+    """Per-step OMLSA-mix gate. Same TF-domain setup as gate_step_omlsa_gating;
+    delegates scoring to _omlsa_residual_tf_mix_score. Higher = better.
+    """
+    import librosa
+
+    xt_mean = step_info["xt_mean"]
+    eps     = cache.get("eps", 1e-10)
+
+    PX = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+    F_model = PX.shape[0]
+
+    if "y_PY" in cache:
+        PY = cache["y_PY"]
+    else:
+        if "_py_tf_cache" not in cache:
+            y_np  = cache["y_np"]
+            n_fft = 2 * (F_model - 1)
+            hop   = 128
+            win   = np.hanning(n_fft).astype(np.float32)
+            win   = win / (win ** 2).sum() ** 0.5
+            Y_stft = librosa.stft(
+                np.asarray(y_np, dtype=np.float32),
+                n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                window=win, center=True,
+            )
+            cache["_py_tf_cache"] = np.abs(Y_stft) ** 2
+        PY = cache["_py_tf_cache"]
+
+    return _omlsa_residual_tf_mix_score(PY, PX, eps=eps)
+
+
+def gate_step_omlsa_mask_agree(step_info: dict, cache: dict) -> float:
+    """Per-step OMLSA mask-agreement gate. Higher = better.
+    Delegates scoring to _omlsa_mask_agree_score.
+    """
+    import librosa
+
+    xt_mean = step_info["xt_mean"]
+    eps     = cache.get("eps", 1e-10)
+
+    PX = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+    F_model = PX.shape[0]
+
+    if "y_PY" in cache:
+        PY = cache["y_PY"]
+    else:
+        if "_py_tf_cache" not in cache:
+            y_np  = cache["y_np"]
+            n_fft = 2 * (F_model - 1)
+            hop   = 128
+            win   = np.hanning(n_fft).astype(np.float32)
+            win   = win / (win ** 2).sum() ** 0.5
+            Y_stft = librosa.stft(
+                np.asarray(y_np, dtype=np.float32),
+                n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                window=win, center=True,
+            )
+            cache["_py_tf_cache"] = np.abs(Y_stft) ** 2
+        PY = cache["_py_tf_cache"]
+
+    return _omlsa_mask_agree_score(PY, PX, eps=eps)
+
+
+def gate_step_omlsa_enhanced_dominant(step_info: dict, cache: dict) -> float:
+    """Per-step enhanced-dominant OMLSA gate. Higher = better.
+    Delegates scoring to _omlsa_enhanced_dominant_score.
+    """
+    import librosa
+
+    xt_mean = step_info["xt_mean"]
+    eps     = cache.get("eps", 1e-10)
+
+    PX = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+    F_model = PX.shape[0]
+
+    if "y_PY" in cache:
+        PY = cache["y_PY"]
+    else:
+        if "_py_tf_cache" not in cache:
+            y_np  = cache["y_np"]
+            n_fft = 2 * (F_model - 1)
+            hop   = 128
+            win   = np.hanning(n_fft).astype(np.float32)
+            win   = win / (win ** 2).sum() ** 0.5
+            Y_stft = librosa.stft(
+                np.asarray(y_np, dtype=np.float32),
+                n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                window=win, center=True,
+            )
+            cache["_py_tf_cache"] = np.abs(Y_stft) ** 2
+        PY = cache["_py_tf_cache"]
+
+    return _omlsa_enhanced_dominant_score(PY, PX, eps=eps)
+
+
+def gate_step_omlsa_enhanced_total_dominant(step_info: dict, cache: dict) -> float:
+    """Per-step enhanced-dominant OMLSA gate, lambda_noise_penalty=0. Higher = better.
+    Identical to omlsa_enhanced_dominant but with no noise-region penalty term.
+    """
+    import librosa
+
+    xt_mean = step_info["xt_mean"]
+    eps     = cache.get("eps", 1e-10)
+
+    PX = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+    F_model = PX.shape[0]
+
+    if "y_PY" in cache:
+        PY = cache["y_PY"]
+    else:
+        if "_py_tf_cache" not in cache:
+            y_np  = cache["y_np"]
+            n_fft = 2 * (F_model - 1)
+            hop   = 128
+            win   = np.hanning(n_fft).astype(np.float32)
+            win   = win / (win ** 2).sum() ** 0.5
+            Y_stft = librosa.stft(
+                np.asarray(y_np, dtype=np.float32),
+                n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                window=win, center=True,
+            )
+            cache["_py_tf_cache"] = np.abs(Y_stft) ** 2
+        PY = cache["_py_tf_cache"]
+
+    return _omlsa_enhanced_dominant_score(PY, PX, eps=eps, lambda_noise_penalty=0.0)
+
+
+def gate_step_omlsa_residual_consistency(step_info: dict, cache: dict) -> float:
+    """Per-step residual-consistency gate. Higher = better.
+    Delegates scoring to _omlsa_residual_consistency_score.
+    """
+    import librosa
+
+    xt_mean = step_info["xt_mean"]
+    eps     = cache.get("eps", 1e-10)
+
+    PX = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+    F_model = PX.shape[0]
+
+    if "y_PY" in cache:
+        PY = cache["y_PY"]
+    else:
+        if "_py_tf_cache" not in cache:
+            y_np  = cache["y_np"]
+            n_fft = 2 * (F_model - 1)
+            hop   = 128
+            win   = np.hanning(n_fft).astype(np.float32)
+            win   = win / (win ** 2).sum() ** 0.5
+            Y_stft = librosa.stft(
+                np.asarray(y_np, dtype=np.float32),
+                n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                window=win, center=True,
+            )
+            cache["_py_tf_cache"] = np.abs(Y_stft) ** 2
+        PY = cache["_py_tf_cache"]
+
+    return _omlsa_residual_consistency_score(PY, PX, eps=eps)
 
 
 def gate_step_stft_leakage(step_info: dict, cache: dict) -> float:
