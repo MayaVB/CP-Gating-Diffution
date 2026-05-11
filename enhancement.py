@@ -386,6 +386,98 @@ def _run_adaptive_k_multilevel_sampling(
     return x_hats[chosen_try], k_target, chosen_try, d0, best_score, True
 
 
+def _run_crc_adaptive_sampling(
+    build_sampler,
+    crc_gate_step,
+    crc_kmax,
+    crc_tau,
+    crc_score,
+    base_seed,
+    gate_cache,
+    model,
+    T_orig,
+    norm_factor,
+):
+    """CRC runtime adaptive policy: accept first sample with g_k >= crc_tau.
+
+    Sequentially generates up to crc_kmax samples, scoring each at crc_gate_step
+    using the specified higher-is-better gating function.  Accepts the first
+    sample that meets the threshold.  If no sample meets the threshold, returns
+    the sample with the highest gating score (argmax fallback).
+
+    Only the current best sample and the current candidate are held in memory —
+    all intermediate samples are discarded immediately.
+
+    Parameters
+    ----------
+    build_sampler  : callable(step_callback=None) → sampler
+    crc_gate_step  : int   — diffusion step index at which to score
+    crc_kmax       : int   — max number of sequential tries
+    crc_tau        : float — acceptance threshold (g_k >= crc_tau to accept)
+    crc_score      : str   — one of the higher-is-better gate function names
+    base_seed      : int|None — try j uses base_seed+j; None = no seeding
+    gate_cache     : dict  — pre-built scoring cache (must contain y_PY for TF scores)
+    model          : ScoreModel
+    T_orig         : int   — original waveform length
+    norm_factor    : float — amplitude normalisation factor
+
+    Returns
+    -------
+    x_hat_sel    : selected enhanced waveform (scaled by norm_factor)
+    selected_try : 0-based index of the accepted try
+    selected_score : gating score of the selected try
+    best_score   : highest gating score seen (== selected_score when not fallback)
+    best_try_idx : 0-based index of the try with the highest gating score
+    fallback_flag : bool — True when threshold was never met (argmax fallback used)
+    num_attempts : int   — total number of tries actually run
+    """
+    _SCORE_MAP = {
+        "omlsa_gating":            "gate_step_omlsa_gating",
+        "omlsa_mix":               "gate_step_omlsa_mix",
+        "omlsa_mask_agree":        "gate_step_omlsa_mask_agree",
+        "omlsa_enhanced_dominant": "gate_step_omlsa_enhanced_dominant",
+    }
+    _fn_name = _SCORE_MAP[crc_score]
+    from utils import speech_gate as _sg
+    _gate_fn = getattr(_sg, _fn_name)
+
+    def _run_try(t):
+        _score_box = [None]
+
+        def _step_cb(_si, _sb=_score_box, _cache=gate_cache, _target=crc_gate_step):
+            if _si["step_idx"] == _target:
+                _sb[0] = _gate_fn(_si, _cache)
+
+        if base_seed is not None:
+            _set_seeds(base_seed + t)
+        sample, _ = build_sampler(step_callback=_step_cb)()
+        x_hat_t = model.to_audio(sample.squeeze(), T_orig) * norm_factor
+        score = _score_box[0] if _score_box[0] is not None else float("-inf")
+        return x_hat_t, score
+
+    # --- Try 0 ---
+    x_hat_cur, g0 = _run_try(0)
+    best_score   = g0
+    best_x_hat   = x_hat_cur
+    best_try_idx = 0
+
+    if g0 >= crc_tau:
+        return x_hat_cur, 0, g0, g0, 0, False, 1
+
+    # --- Tries 1..crc_kmax-1 ---
+    for _t in range(1, crc_kmax):
+        x_hat_cur, g_k = _run_try(_t)
+        if g_k > best_score:
+            best_score   = g_k
+            best_x_hat   = x_hat_cur
+            best_try_idx = _t
+        if g_k >= crc_tau:
+            return x_hat_cur, _t, g_k, best_score, best_try_idx, False, _t + 1
+
+    # Fallback: return argmax sample
+    return best_x_hat, best_try_idx, best_score, best_score, best_try_idx, True, crc_kmax
+
+
 def _save_latent_cache(save_dir, filename, xt_box, gate_cache, try_idx=None):
     """Save xt_mean and PY for one utterance to a .npz file.
 
@@ -657,10 +749,25 @@ if __name__ == '__main__':
     parser.add_argument("--save_steps_dir_prefix", type=str, default="step", help="Directory prefix for step snapshots; outputs to {enhanced_dir}/{prefix}_{k:03d}/")
     parser.add_argument("--save_steps_limit", type=int, default=0, help="If >0, save step snapshots only for first N utterances (0 = no limit; use with --save_steps_all)")
     # --- Adaptive-K policy args ---
-    parser.add_argument("--policy", choices=["legacy", "adaptive_k", "adaptive_k_multilevel"], default="legacy",
+    parser.add_argument("--policy", choices=["legacy", "adaptive_k", "adaptive_k_multilevel", "crc_adaptive"],
+                        default="legacy",
                         help="Inference policy: 'legacy' = existing per-step gate/restart (default); "
                              "'adaptive_k' = binary difficulty-based K escalation; "
-                             "'adaptive_k_multilevel' = multi-level difficulty-based K escalation")
+                             "'adaptive_k_multilevel' = multi-level difficulty-based K escalation; "
+                             "'crc_adaptive' = CRC sequential threshold with argmax fallback (higher-is-better scores)")
+    # --- CRC adaptive policy args ---
+    parser.add_argument("--crc_tau", type=float, default=None,
+                        help="Acceptance threshold for crc_adaptive policy: accept first sample with g_k >= crc_tau. "
+                             "Required when --policy crc_adaptive.")
+    parser.add_argument("--crc_kmax", type=int, default=10,
+                        help="Max number of sequential tries for crc_adaptive policy (default: 10; must be >= 1)")
+    parser.add_argument("--crc_score", type=str, default=None,
+                        choices=["omlsa_gating", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant"],
+                        help="Gating score for crc_adaptive policy (higher = better). "
+                             "Required when --policy crc_adaptive.")
+    parser.add_argument("--crc_gate_step", type=int, default=None,
+                        help="Diffusion step index at which to compute the CRC gating score. "
+                             "Required when --policy crc_adaptive.")
     parser.add_argument("--adaptive_score", choices=["wiener_residual", "omlsa_residual", "omlsa_residual_tf"], default="wiener_residual",
                         help="Post-hoc score used for adaptive-K difficulty and selection (default: wiener_residual)")
     parser.add_argument("--adaptive_tau", type=float, default=None,
@@ -713,6 +820,18 @@ if __name__ == '__main__':
                         help="Comma-separated ascending thresholds for multi-level mid-step gating. "
                              "Length must be len(k_levels)-1. E.g. 'tau1,tau2,tau3' for k_levels=1,3,5,10.")
     args = parser.parse_args()
+
+    if args.policy == "crc_adaptive":
+        if args.crc_tau is None:
+            raise ValueError("--crc_tau is required when --policy crc_adaptive")
+        if args.crc_score is None:
+            raise ValueError("--crc_score is required when --policy crc_adaptive")
+        if args.crc_gate_step is None:
+            raise ValueError("--crc_gate_step is required when --policy crc_adaptive")
+        if args.crc_kmax < 1:
+            raise ValueError(f"--crc_kmax must be >= 1, got: {args.crc_kmax}")
+        if args.latent_gate_enable:
+            raise ValueError("--latent_gate_enable and --policy crc_adaptive are mutually exclusive")
 
     if args.policy == "adaptive_k" and args.adaptive_tau is None:
         raise ValueError("--adaptive_tau is required when --policy adaptive_k")
@@ -916,6 +1035,8 @@ if __name__ == '__main__':
     _ak_log = [] if args.policy in ("adaptive_k", "adaptive_k_multilevel") else None
     # Per-utterance log for latent gate mode
     _lg_log = [] if args.latent_gate_enable else None
+    # Per-utterance log for crc_adaptive mode
+    _crc_log = [] if args.policy == "crc_adaptive" else None
 
     # Enhance files
     for _utt_idx, noisy_file in enumerate(tqdm(noisy_files)):
@@ -1142,6 +1263,54 @@ if __name__ == '__main__':
             _save_steps_utt_idx[0] += 1
             continue
 
+        if args.policy == "crc_adaptive":
+            _crc_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
+            _crc_yf_power = (Y[0].abs() ** 2).sum(dim=(0, 1)).detach().cpu().numpy()
+            _crc_cache = {
+                "speech_mask_frames": _crc_yf_power > np.percentile(_crc_yf_power, 80),
+                "eps": 1e-8,
+                "y_PY": (Y[0].abs() ** 2).sum(dim=0).detach().cpu().numpy(),
+            }
+            (x_hat,
+             _crc_sel_try,
+             _crc_sel_score,
+             _crc_best_score,
+             _crc_best_try_idx,
+             _crc_fallback,
+             _crc_num_attempts) = _run_crc_adaptive_sampling(
+                build_sampler=_build_sampler,
+                crc_gate_step=args.crc_gate_step,
+                crc_kmax=args.crc_kmax,
+                crc_tau=args.crc_tau,
+                crc_score=args.crc_score,
+                base_seed=_crc_base_seed,
+                gate_cache=_crc_cache,
+                model=model,
+                T_orig=T_orig,
+                norm_factor=norm_factor,
+            )
+            print(f"[crc_adaptive] file={filename}  utt_idx={_utt_idx}  "
+                  f"base_seed={_crc_base_seed}  "
+                  f"selected_try={_crc_sel_try}  selected_score={_crc_sel_score:.4f}  "
+                  f"best_score={_crc_best_score:.4f}  fallback={_crc_fallback}  "
+                  f"num_attempts={_crc_num_attempts}")
+            _crc_log.append({
+                "filename":       filename,
+                "selected_try":   _crc_sel_try,
+                "selected_score": round(float(_crc_sel_score), 6),
+                "best_score":     round(float(_crc_best_score), 6),
+                "best_try_idx":   _crc_best_try_idx,
+                "fallback_flag":  int(_crc_fallback),
+                "num_attempts":   _crc_num_attempts,
+                "crc_tau":        args.crc_tau,
+                "crc_score":      args.crc_score,
+                "crc_gate_step":  args.crc_gate_step,
+            })
+            makedirs(dirname(join(args.enhanced_dir, filename)), exist_ok=True)
+            write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
+            _save_steps_utt_idx[0] += 1
+            continue
+
         # Build per-step cache once per utterance whenever per-step scoring is needed.
         if args.gate_tau_path or args.gate_compute_tau:
             _yf_power = (Y[0].abs() ** 2).sum(dim=(0, 1)).detach().cpu().numpy()
@@ -1321,6 +1490,26 @@ if __name__ == '__main__':
             write(join(args.enhanced_dir, filename), x_hat.cpu().numpy(), target_sr)
 
         _save_steps_utt_idx[0] += 1
+
+    if args.policy == "crc_adaptive" and _crc_log:
+        _crc_csv_path = join(args.enhanced_dir, "crc_runtime_log.csv")
+        _crc_fields = ["filename", "selected_try", "selected_score", "best_score",
+                       "best_try_idx", "fallback_flag", "num_attempts",
+                       "crc_tau", "crc_score", "crc_gate_step"]
+        with open(_crc_csv_path, "w", newline="") as _f:
+            _writer = csv.DictWriter(_f, fieldnames=_crc_fields)
+            _writer.writeheader()
+            _writer.writerows(_crc_log)
+        _n_crc = len(_crc_log)
+        _mean_attempts  = sum(r["num_attempts"]  for r in _crc_log) / _n_crc
+        _n_fallback     = sum(r["fallback_flag"] for r in _crc_log)
+        _n_escalated    = sum(1 for r in _crc_log if r["num_attempts"] > 1)
+        print(f"\nCRC runtime log saved to {_crc_csv_path}")
+        print("\n--- CRC Adaptive Run Summary ---")
+        print(f"n_files          = {_n_crc}")
+        print(f"avg_attempts     = {_mean_attempts:.2f}")
+        print(f"escalation_rate  = {_n_escalated / _n_crc:.1%}  ({_n_escalated}/{_n_crc} files used > 1 try)")
+        print(f"fallback_rate    = {_n_fallback / _n_crc:.1%}  ({_n_fallback}/{_n_crc} files hit retry cap)")
 
     if args.latent_gate_enable and _lg_log:
         _lg_csv_path = join(args.enhanced_dir, "latent_gate_log.csv")
