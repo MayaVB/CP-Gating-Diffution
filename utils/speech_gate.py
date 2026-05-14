@@ -1998,6 +1998,51 @@ def gate_step_omlsa_gating(step_info: dict, cache: dict) -> float:
     return _omlsa_gating_score(PY, PX, eps=eps)
 
 
+def gate_step_relative_omlsa(step_info: dict, cache: dict) -> float:
+    """Log-ratio OMLSA gate. Higher = better.
+
+    PH1 is derived from PY (noisy) only, via the same IMCRA backbone as
+    gate_step_omlsa_gating.  The score measures how much the enhanced signal
+    improves the speech/noise energy ratio relative to the noisy input:
+
+      g(Z) = Σ PH1_Y·Z²  /  (Σ (1-PH1_Y)·Z² + ε)
+      score = log( (g(X) + ε) / (g(Y) + ε) )
+
+    Positive → enhancement improved the speech/noise ratio vs noisy input.
+    Negative → enhancement degraded it.
+    Each try is scored independently (no cross-try state).
+    """
+    import librosa
+
+    xt_mean = step_info["xt_mean"]
+    eps     = cache.get("eps", 1e-10)
+
+    PX = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+    F_model = PX.shape[0]
+
+    if "y_PY" in cache:
+        PY = cache["y_PY"]
+    else:
+        if "_py_tf_cache" not in cache:
+            y_np  = cache["y_np"]
+            n_fft = 2 * (F_model - 1)
+            hop   = 128
+            win   = np.hanning(n_fft).astype(np.float32)
+            win   = win / (win ** 2).sum() ** 0.5
+            Y_stft = librosa.stft(
+                np.asarray(y_np, dtype=np.float32),
+                n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                window=win, center=True,
+            )
+            cache["_py_tf_cache"] = np.abs(Y_stft) ** 2
+        PY = cache["_py_tf_cache"]
+
+    g_x = _omlsa_gating_score(PY, PX, eps=eps)   # IMCRA on PY, scored on PX
+    g_y = _omlsa_gating_score(PY, PY, eps=eps)   # same IMCRA on PY, scored on PY
+    score = float(np.log((g_x + eps) / (g_y + eps)))
+    return score if np.isfinite(score) else 0.0
+
+
 def gate_step_omlsa_mix(step_info: dict, cache: dict) -> float:
     """Per-step OMLSA-mix gate. Same TF-domain setup as gate_step_omlsa_gating;
     delegates scoring to _omlsa_residual_tf_mix_score. Higher = better.

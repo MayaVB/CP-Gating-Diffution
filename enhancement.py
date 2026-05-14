@@ -588,6 +588,8 @@ def _run_latent_gate_sampling(
         from utils.speech_gate import gate_step_omlsa_mask_agree as _gate_fn
     elif latent_gate_score == "omlsa_enhanced_dominant":
         from utils.speech_gate import gate_step_omlsa_enhanced_dominant as _gate_fn
+    elif latent_gate_score == "relative_omlsa":
+        from utils.speech_gate import gate_step_relative_omlsa as _gate_fn
     else:
         raise ValueError(f"Unknown latent_gate_score: {latent_gate_score!r}")
 
@@ -801,7 +803,7 @@ if __name__ == '__main__':
     parser.add_argument("--latent_gate_max_retries", type=int, default=10,
                         help="Max additional retries after try 0 for sequential_threshold policy "
                              "(total max samples = 1 + latent_gate_max_retries; default: 10)")
-    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_gating", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant"],
+    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_gating", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant", "relative_omlsa"],
                         default="wiener_residual",
                         help="Mid-step scoring function: 'wiener_residual' (default) uses static median noise; "
                              "'wiener_tf' uses IMCRA adaptive noise tracking on model-domain PY (no waveform conversion); "
@@ -1115,7 +1117,7 @@ if __name__ == '__main__':
                 _lg_cache["T_orig"]      = T_orig
                 _lg_cache["norm_factor"] = norm_factor
                 _lg_cache["y_np"]        = y.squeeze().cpu().numpy()
-            elif args.latent_gate_score in ("omlsa_residual_tf", "omlsa_gating", "wiener_tf", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant"):
+            elif args.latent_gate_score in ("omlsa_residual_tf", "omlsa_gating", "wiener_tf", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant", "relative_omlsa"):
                 # Option A: use the model-domain noisy power spectrum directly.
                 # Y[0] is [C, F, T_spec]; sum over channels → [F, T_spec].
                 # This is the exact same TF grid as xt_mean, so no STFT mismatch.
