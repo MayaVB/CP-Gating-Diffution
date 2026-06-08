@@ -9,6 +9,7 @@ import json
 import numpy as np
 import pandas as pd
 import librosa
+from scipy import stats as _scipy_stats
 
 from pystoi import stoi
 
@@ -46,6 +47,37 @@ except ImportError:
         if sr == 16000:
             return audio
         return librosa.resample(audio, orig_sr=sr, target_sr=16000)
+
+
+def _tail_stats(series: pd.Series, ci: float = 0.95, n_boot: int = 9999, seed: int = 0) -> dict:
+    arr = series.dropna().to_numpy()
+    n = len(arr)
+    p10, p5, p1 = np.percentile(arr, [10, 5, 1], method="linear")
+    mean_val = float(np.mean(arr))
+
+    # Mean CI: exact t-interval
+    sem = float(np.std(arr, ddof=1)) / np.sqrt(n)
+    mean_lo, mean_hi = _scipy_stats.t.interval(ci, df=n - 1, loc=mean_val, scale=sem)
+
+    # Percentile CIs: percentile bootstrap
+    rng = np.random.default_rng(seed)
+    boot = rng.choice(arr, size=(n_boot, n), replace=True)
+    boot_p10 = np.percentile(boot, 10, axis=1, method="linear")
+    boot_p5  = np.percentile(boot,  5, axis=1, method="linear")
+    boot_p1  = np.percentile(boot,  1, axis=1, method="linear")
+    q_lo, q_hi = 100 * (1 - ci) / 2, 100 * (1 - (1 - ci) / 2)
+
+    return {
+        "n":       n,
+        "mean":    mean_val,
+        "mean_ci": (float(mean_lo), float(mean_hi)),
+        "p10":     float(p10),
+        "p10_ci":  (float(np.percentile(boot_p10, q_lo)), float(np.percentile(boot_p10, q_hi))),
+        "p5":      float(p5),
+        "p5_ci":   (float(np.percentile(boot_p5,  q_lo)), float(np.percentile(boot_p5,  q_hi))),
+        "p1":      float(p1),
+        "p1_ci":   (float(np.percentile(boot_p1,  q_lo)), float(np.percentile(boot_p1,  q_hi))),
+    }
 
 
 if __name__ == '__main__':
@@ -174,65 +206,88 @@ if __name__ == '__main__':
     # Save DataFrame as csv file
     df.to_csv(join(args.enhanced_dir, "_results.csv"), index=False)
 
-    # Tail SI-SDR stats (per-utterance arrays)
-    # Table 2 uses sisdr_enh (ABSOLUTE SI-SDR enhanced vs clean) only.
-    # delta_sisdr is stored for sanity checking but NOT reported in Table 2.
+    # Tail metrics (per-utterance arrays)
     enh   = df["sisdr_enh"].to_numpy()
     noisy = df["sisdr_noisy"].to_numpy()
     delta = df["delta_sisdr"].to_numpy()
-    enh_p10, enh_p5, enh_p1 = np.percentile(enh, [10, 5, 1], method="linear")
-    tail_stats = {
-        "n":              len(enh),
-        "sisdr_enh_mean": float(np.mean(enh)),
-        "sisdr_enh_p10":  float(enh_p10),
-        "sisdr_enh_p5":   float(enh_p5),
-        "sisdr_enh_p1":   float(enh_p1),
-    }
-    table2_line = (
-        f"sisdr_enh (absolute):  "
-        f"mean={tail_stats['sisdr_enh_mean']:.2f}  "
-        f"p10={tail_stats['sisdr_enh_p10']:.2f}  "
-        f"p5={tail_stats['sisdr_enh_p5']:.2f}  "
-        f"p1={tail_stats['sisdr_enh_p1']:.2f}"
-    )
-    latex_line = (
-        f"LaTeX row:  "
-        f"{tail_stats['sisdr_enh_mean']:.1f} & "
-        f"{tail_stats['sisdr_enh_p10']:.1f} & "
-        f"{tail_stats['sisdr_enh_p5']:.1f} & "
-        f"{tail_stats['sisdr_enh_p1']:.1f}"
-    )
-    print("\n--- Tail SI-SDR (Table 2) ---")
-    print(f"n={tail_stats['n']}")
-    print(table2_line)
-    print(latex_line)
-    log.write("\n--- Tail SI-SDR (Table 2) ---\n")
-    log.write(f"n={tail_stats['n']}\n")
-    log.write(table2_line + "\n")
-    log.write(latex_line + "\n")
+
+    _tail_cols = [
+        ("sisdr_enh", "sisdr_enh (absolute):"),
+        ("pesq",      "pesq (absolute):"),
+        ("estoi",     "estoi (absolute):"),
+        ("si_sir",    "si_sir (absolute):"),
+        ("si_sar",    "si_sar (absolute):"),
+    ]
+    _label_w = max(len(lbl) for _, lbl in _tail_cols) + 2  # 2 spaces after longest label
+
+    def _fmt(val, ci_bounds):
+        return f"{val:.2f} [{ci_bounds[0]:.2f},{ci_bounds[1]:.2f}]"
+
+    tail_metric_stats = {}
+    n_tail = int(df["sisdr_enh"].dropna().count())
+
+    print("\n--- Tail metrics ---")
+    print(f"n={n_tail}")
+    log.write("\n--- Tail metrics ---\n")
+    log.write(f"n={n_tail}\n")
+
+    for col, label in _tail_cols:
+        stats = _tail_stats(df[col])
+        tail_metric_stats[col] = stats
+        assert stats['p10'] >= stats['p5'] >= stats['p1'], \
+            f"FAIL: {col} percentiles not monotone!"
+        line = (
+            f"{label:<{_label_w}}"
+            f"mean={_fmt(stats['mean'], stats['mean_ci'])}  "
+            f"p10={_fmt(stats['p10'], stats['p10_ci'])}  "
+            f"p5={_fmt(stats['p5'], stats['p5_ci'])}  "
+            f"p1={_fmt(stats['p1'], stats['p1_ci'])}"
+        )
+        print(line)
+        log.write(line + "\n")
+
     log.close()
+
+    # Multi-metric JSON and per-utt CSV
+    _multi_json_path = join(args.enhanced_dir, "tail_metric_stats.json")
+    _multi_csv_path  = join(args.enhanced_dir, "tail_metric_perutt.csv")
+    with open(_multi_json_path, "w") as _f:
+        json.dump(tail_metric_stats, _f, indent=2)
+    df[["filename", "sisdr_enh", "pesq", "estoi", "si_sir", "si_sar"]].to_csv(_multi_csv_path, index=False)
+
+    # Backward compat: legacy single-metric files
     _csv_path  = join(args.enhanced_dir, "tail_sisdr_perutt.csv")
     _json_path = join(args.enhanced_dir, "tail_sisdr_stats.json")
+    _s = tail_metric_stats["sisdr_enh"]
+    tail_stats = {
+        "n":              _s["n"],
+        "sisdr_enh_mean": _s["mean"],
+        "sisdr_enh_p10":  _s["p10"],
+        "sisdr_enh_p5":   _s["p5"],
+        "sisdr_enh_p1":   _s["p1"],
+    }
     df[["filename", "sisdr_enh", "sisdr_noisy", "delta_sisdr"]].to_csv(_csv_path, index=False)
+    with open(_json_path, "w") as _f:
+        json.dump(tail_stats, _f, indent=2)
+
     if _dnsmos_enabled:
         _dns_csv = join(args.enhanced_dir, "dnsmos_perutt.csv")
         df[["filename", "dnsmos_ovrl"]].rename(columns={"dnsmos_ovrl": "dnsmos"}).to_csv(_dns_csv, index=False)
     if use_nisqa:
         _nisqa_csv = join(args.enhanced_dir, "nisqa_perutt.csv")
         df[["filename", "nisqa_ovrl"]].rename(columns={"nisqa_ovrl": "nisqa"}).to_csv(_nisqa_csv, index=False)
-    with open(_json_path, "w") as _f:
-        json.dump(tail_stats, _f, indent=2)
 
     # Verification
     import os as _os
     print("\n--- Verification ---")
-    print(f"tail_sisdr_perutt.csv : {_os.path.abspath(_csv_path)}")
-    print(f"tail_sisdr_stats.json : {_os.path.abspath(_json_path)}")
+    print(f"tail_metric_perutt.csv : {_os.path.abspath(_multi_csv_path)}")
+    print(f"tail_metric_stats.json : {_os.path.abspath(_multi_json_path)}")
+    print(f"tail_sisdr_perutt.csv  : {_os.path.abspath(_csv_path)}")
+    print(f"tail_sisdr_stats.json  : {_os.path.abspath(_json_path)}")
     print(f"n={tail_stats['n']}  sisdr_enh min={enh.min():.2f}  max={enh.max():.2f}")
-    print(f"sisdr_noisy mean={noisy.mean():.2f}  delta mean={delta.mean():.2f}  (sanity: sisdr_enh_mean - sisdr_noisy_mean = {np.mean(enh)-np.mean(noisy):.2f})")
-    assert tail_stats['sisdr_enh_p10'] >= tail_stats['sisdr_enh_p5'] >= tail_stats['sisdr_enh_p1'], \
-        "FAIL: percentiles not monotone!"
-    print("Monotonicity check: p10 >= p5 >= p1  PASS")
+    print(f"sisdr_noisy mean={noisy.mean():.2f}  delta mean={delta.mean():.2f}  "
+          f"(sanity: sisdr_enh_mean - sisdr_noisy_mean = {np.mean(enh)-np.mean(noisy):.2f})")
+    print("Monotonicity check: p10 >= p5 >= p1  PASS (all metrics)")
     print("First 3 rows (filename | sisdr_noisy | sisdr_enh | delta):")
     for _i in range(min(3, len(records))):
         r = records[_i]
