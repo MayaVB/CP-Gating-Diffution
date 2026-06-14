@@ -590,6 +590,10 @@ def _run_latent_gate_sampling(
         from utils.speech_gate import gate_step_omlsa_enhanced_dominant as _gate_fn
     elif latent_gate_score == "relative_omlsa":
         from utils.speech_gate import gate_step_relative_omlsa as _gate_fn
+    elif latent_gate_score == "logvar":
+        from utils.speech_gate import gate_step_logvar as _gate_fn
+    elif latent_gate_score == "emd_p9010":
+        from utils.speech_gate import gate_step_emd_p9010 as _gate_fn
     else:
         raise ValueError(f"Unknown latent_gate_score: {latent_gate_score!r}")
 
@@ -728,6 +732,7 @@ if __name__ == '__main__':
     parser.add_argument("--corrector", type=str, choices=("ald", "langevin", "none"), default="ald", help="Corrector class for the PC sampler.")
     parser.add_argument("--corrector_steps", type=int, default=1, help="Number of corrector steps")
     parser.add_argument("--snr", type=float, default=0.5, help="SNR value for (annealed) Langevin dynmaics")
+    parser.add_argument("--predictor_noise_scale", type=float, default=1.0, help="Temperature scaling for predictor noise (tau>1 increases diversity across seeds, tau<1 more deterministic)")
     parser.add_argument("--N", type=int, default=30, help="Number of reverse steps")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use for inference")
     parser.add_argument("--t_eps", type=float, default=0.03, help="The minimum process time (0.03 by default)")
@@ -803,14 +808,16 @@ if __name__ == '__main__':
     parser.add_argument("--latent_gate_max_retries", type=int, default=10,
                         help="Max additional retries after try 0 for sequential_threshold policy "
                              "(total max samples = 1 + latent_gate_max_retries; default: 10)")
-    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_gating", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant", "relative_omlsa"],
+    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_gating", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant", "relative_omlsa", "logvar", "emd_p9010"],
                         default="wiener_residual",
                         help="Mid-step scoring function: 'wiener_residual' (default) uses static median noise; "
                              "'wiener_tf' uses IMCRA adaptive noise tracking on model-domain PY (no waveform conversion); "
                              "'omlsa_residual' converts latent to audio and applies full OMLSA scoring; "
                              "'omlsa_residual_tf' applies full OMLSA scoring directly on xt_mean in TF domain "
                              "(no waveform conversion; requires y_PY cached from model input); "
-                             "'omlsa_gating' same backbone, simplified score: residual-noise / preserved-speech energy ratio.")
+                             "'omlsa_gating' same backbone, simplified score: residual-noise / preserved-speech energy ratio; "
+                             "'logvar' GLEMD via variance — Var(log(Σ_k PX(k,l))); higher=better, no PY/IMCRA; "
+                             "'emd_p9010' GLEMD via P90-P10 contrast — same grounding as logvar, more outlier-robust.")
     parser.add_argument("--latent_gate_save_latents", type=str, default=None,
                         metavar="DIR",
                         help="If set, save per-file latent cache (PX, PY as .npz) to DIR after try 0. "
@@ -1069,6 +1076,7 @@ if __name__ == '__main__':
                 if args.sampler_type == 'pc':
                     return model.get_pc_sampler('reverse_diffusion', args.corrector, Y.to(args.device), N=args.N,
                         corrector_steps=args.corrector_steps, snr=args.snr,
+                        predictor_noise_scale=args.predictor_noise_scale,
                         step_callback=step_callback)
                 elif args.sampler_type == 'ode':
                     return model.get_ode_sampler(Y.to(args.device), N=args.N)
