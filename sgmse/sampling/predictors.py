@@ -54,14 +54,15 @@ class EulerMaruyamaPredictor(Predictor):
 
 @PredictorRegistry.register('reverse_diffusion')
 class ReverseDiffusionPredictor(Predictor):
-    def __init__(self, sde, score_fn, probability_flow=False):
+    def __init__(self, sde, score_fn, probability_flow=False, noise_scale=1.0):
         super().__init__(sde, score_fn, probability_flow=probability_flow)
+        self.noise_scale = noise_scale
 
     def update_fn(self, x, y, t, stepsize):
         f, g = self.rsde.discretize(x, y, t, stepsize)
         z = torch.randn_like(x)
         x_mean = x - f
-        x = x_mean + g[:, None, None, None] * z
+        x = x_mean + self.noise_scale * g[:, None, None, None] * z
         return x, x_mean
 
 

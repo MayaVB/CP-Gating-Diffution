@@ -26,7 +26,7 @@ def from_flattened_numpy(x, shape):
 def get_pc_sampler(
     predictor_name, corrector_name, sde, score_fn, y,
     denoise=True, eps=3e-2, snr=0.1, corrector_steps=1, probability_flow: bool = False,
-    intermediate=False, step_callback=None, **kwargs
+    intermediate=False, step_callback=None, predictor_noise_scale=1.0, **kwargs
 ):
     """Create a Predictor-Corrector (PC) sampler.
 
@@ -46,7 +46,7 @@ def get_pc_sampler(
     """
     predictor_cls = PredictorRegistry.get_by_name(predictor_name)
     corrector_cls = CorrectorRegistry.get_by_name(corrector_name)
-    predictor = predictor_cls(sde, score_fn, probability_flow=probability_flow)
+    predictor = predictor_cls(sde, score_fn, probability_flow=probability_flow, noise_scale=predictor_noise_scale)
     corrector = corrector_cls(sde, score_fn, snr=snr, n_steps=corrector_steps)
 
     def pc_sampler():
