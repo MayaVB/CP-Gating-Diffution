@@ -2483,6 +2483,150 @@ def gate_step_pred_jump(step_info: dict, cache: dict) -> float:
     return score
 
 
+def _logvar_score(PX: np.ndarray, eps: float = 1e-10) -> float:
+    """Log-power variance of the output temporal envelope. Higher = better.
+
+    score = Var( log( Σ_k PX(k,l) + ε ) )
+
+    Measures the speech/silence dynamic range of the enhanced output in
+    log-power space.  A well-enhanced signal has deep quiet pauses and loud
+    speech bursts → high log-variance.  A noisy output has the noise floor
+    raising the quiet frames → low log-variance.
+
+    No IMCRA, no PY, no thresholds — only the output latent PX is needed.
+    Grounded in a two-state speech model: under speech-active (μ_s) and
+    silence (μ_n) states with fraction p speech-active,
+        Var(log E_X) ≈ p(1−p)·(log μ_s − log μ_n)²
+    which directly quantifies the log speech/silence energy contrast.
+    """
+    E = PX.sum(axis=0)                        # [T] temporal power envelope
+    return float(np.var(np.log(E + eps)))
+
+
+def gate_step_logvar(step_info: dict, cache: dict) -> float:
+    """Per-step log-power variance gate. Higher = better.
+
+    Computes Var(log(E_X + ε)) where E_X(l) = Σ_k |xt_mean(k,l)|².
+    Does not use PY — no IMCRA, no noisy-input cache required.
+
+    step_info keys (used):
+        xt_mean : torch.Tensor [B, C, F, T_spec] — denoised latent estimate
+
+    cache keys (optional):
+        eps : float (default 1e-10)
+
+    Returns:
+        float: log-power variance of output envelope. Higher = better.
+    """
+    xt_mean = step_info["xt_mean"]
+    eps     = cache.get("eps", 1e-10)
+    PX = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()   # [F, T_spec]
+    return _logvar_score(PX, eps=eps)
+
+
+# ---------------------------------------------------------------------------
+# Envelope Modulation Depth (EMD) family
+# ---------------------------------------------------------------------------
+#
+# Theoretical grounding (Modulation Transfer Function / STI framework):
+#
+#   Speech intelligibility depends on preservation of the temporal-envelope
+#   modulation structure.  Noise and reverberation reduce modulation depth.
+#
+#   For broadband residual noise (dns_noreverb failure mode), the noise
+#   floor raises *every* frame uniformly:
+#
+#     z(t) = log(E(t) + noise_floor) ≈ log(noise_floor)   for quiet frames
+#
+#   This collapses the dynamic range of z(t).  The discriminative signal is
+#   therefore the *absolute depth* of the log-envelope swing, not the
+#   redistribution of modulation energy across frequency bands (which is
+#   what SRMR/modulation-ratio scores measure and why they collapse here).
+#
+#   logvar = Var(z(t)) is the simplest measure of this depth.  The three
+#   variants below test whether robust alternatives outperform variance
+#   while remaining in the same MTF-grounded framework.
+#
+#   All four are measuring the same quantity:
+#       Global Log-Envelope Modulation Depth (GLEMD)
+#   under different estimators.
+#
+# Implementation note:
+#   `logvar` is the special case method="var".  The function below unifies
+#   all four variants; gate_step_logvar is kept unchanged for compatibility.
+# ---------------------------------------------------------------------------
+
+def _envelope_mod_depth_score(
+    PX: np.ndarray,
+    method: str = "var",
+    eps: float = 1e-10,
+) -> float:
+    """Global log-envelope modulation depth (GLEMD) with four estimators.
+
+    All methods share the same pipeline:
+        E(t) = sum_k PX(k,t)          — global power envelope  [T]
+        z(t) = log(E(t) + eps)        — log-compress
+
+    then estimate the spread of z(t):
+
+      "var"    — Var(z)              = logvar (variance)
+      "p9010"  — P90(z) − P10(z)    = 80th-percentile contrast
+      "iqr"    — P75(z) − P25(z)    = interquartile range
+      "mad"    — median(|z − median(z)|)  = median absolute deviation
+
+    All return a non-negative float.  Higher = deeper modulation = better.
+    The "var" result is numerically identical to _logvar_score.
+
+    PX     : [K, T] non-negative latent power spectrum
+    method : one of {"var", "p9010", "iqr", "mad"}
+    eps    : numerical floor before log
+    """
+    E = PX.sum(axis=0)                  # [T]
+    z = np.log(E + eps)
+
+    if method == "var":
+        return float(np.var(z))
+    if method == "p9010":
+        return float(np.percentile(z, 90) - np.percentile(z, 10))
+    if method == "iqr":
+        return float(np.percentile(z, 75) - np.percentile(z, 25))
+    if method == "mad":
+        return float(np.median(np.abs(z - np.median(z))))
+    raise ValueError(f"Unknown EMD method: {method!r}. Choose var/p9010/iqr/mad.")
+
+
+def gate_step_emd_p9010(step_info: dict, cache: dict) -> float:
+    """Global log-envelope modulation depth — P90−P10 contrast. Higher = better.
+
+    Percentile contrast of z(t) = log(Σ_k PX(k,t) + ε).
+    More robust than variance to occasional near-silence or clipped frames.
+    Numerically: P90(z) − P10(z).
+
+    step_info keys (used):  xt_mean [B, C, F, T_spec]
+    cache keys (optional):  eps (default 1e-10)
+    """
+    xt_mean = step_info["xt_mean"]
+    eps     = cache.get("eps", 1e-10)
+    PX = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+    return _envelope_mod_depth_score(PX, method="p9010", eps=eps)
+
+# (LTSV and global_mod_ratio removed after empirical evaluation on dns_noreverb:
+#  both underperformed logvar/emd_p9010.  LTSV failed due to near-eps channel
+#  instability; global_mod_ratio failed because DNS noise collapses modulation
+#  depth uniformly, making ratios uninformative.)
+# Latent analogue: replace the STFT magnitude spectrum S(k,t) with the
+# model-domain power PX(k,t) = Σ_c |xt_mean(c,k,t)|².
+#
+# Relation to logvar:
+#   logvar  = Var_t( log( Σ_k PX(k,t) ) )   — variance of the summed envelope
+#   ltsv    = mean_k( Var_t( log PX(k,t) ) ) — mean of per-channel variances
+#
+# logvar collapses frequency first, so it is dominated by the most energetic
+# bands.  ltsv weights each channel equally before aggregating, making it
+# sensitive to noise that fills low-energy bands without disturbing the
+# overall loudness envelope.
+# ---------------------------------------------------------------------------
+
 def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> dict:
     """Return {gate_name: score} for each requested gate at this diffusion step.
 
@@ -2510,6 +2654,12 @@ def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> d
         "pred_jump"            — Relative squared displacement between consecutive
                                  model prediction (score) tensors.  Speech-agnostic.
                                  Higher = larger jump in score = worse.
+        "logvar"               — Global Log-Envelope Modulation Depth (GLEMD) via variance.
+                                 Var(log(Σ_k PX(k,l) + ε)).  No PY / IMCRA needed.
+                                 Higher = deeper speech/silence envelope contrast = better.
+        "emd_p9010"            — GLEMD via P90−P10 percentile contrast of log-envelope.
+                                 Statistically equivalent to logvar on dns_noreverb;
+                                 more robust to individual outlier frames.  Higher = better.
 
     Adding a new gate requires registering it in the if/elif chain below.
     """
@@ -2533,6 +2683,10 @@ def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> d
             scores["traj_curvature"] = gate_step_traj_curvature(step_info, cache)
         elif gate == "pred_jump":
             scores["pred_jump"] = gate_step_pred_jump(step_info, cache)
+        elif gate == "logvar":
+            scores["logvar"] = gate_step_logvar(step_info, cache)
+        elif gate == "emd_p9010":
+            scores["emd_p9010"] = gate_step_emd_p9010(step_info, cache)
     return scores
 
 
