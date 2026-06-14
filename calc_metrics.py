@@ -142,7 +142,16 @@ if __name__ == '__main__':
         x, sr_x = read(join(args.clean_dir, clean_filename))
         y, sr_y = read(join(args.noisy_dir, filename))
         x_hat, sr_x_hat = read(enh_path)
-        assert sr_x == sr_y == sr_x_hat
+        assert sr_x == sr_y, f"clean/noisy sr mismatch: {sr_x} vs {sr_y}"
+        if sr_x_hat != sr_x:
+            x_hat = librosa.resample(x_hat, orig_sr=sr_x_hat, target_sr=sr_x)
+            sr_x_hat = sr_x
+            # align length (resampling can be off by 1-2 samples)
+            tgt = len(x)
+            if len(x_hat) > tgt:
+                x_hat = x_hat[:tgt]
+            elif len(x_hat) < tgt:
+                x_hat = np.pad(x_hat, (0, tgt - len(x_hat)))
         n = y - x
         x_hat_16k = librosa.resample(x_hat, orig_sr=sr_x_hat, target_sr=16000) if sr_x_hat != 16000 else x_hat
         x_16k     = librosa.resample(x,     orig_sr=sr_x,     target_sr=16000) if sr_x     != 16000 else x
