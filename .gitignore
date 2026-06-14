@@ -5,6 +5,7 @@
 checkpoints_updated/
 .yaml
 .npy
+*.wav
 voicebank/
 nisqa_weights/
 wsj0_chime3/
@@ -15,6 +16,8 @@ old/
 plotting_scripts/
 additional_scripts/
 dns_train_synth/
+libriwhamr/
+demand_noise/
 
 ### Emacs ###
 # -*- mode: gitignore; -*-
