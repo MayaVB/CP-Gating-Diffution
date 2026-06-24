@@ -18,6 +18,14 @@ additional_scripts/
 dns_train_synth/
 libriwhamr/
 demand_noise/
+dns_audioset_libri_m3063/
+libri_demand_sim/
+ears_wham_test/
+dns_audioset_social/
+ms_snsd_libri_lowsnr/
+ms_snsd_libri_nonstat_m3063/
+libri-wham-focus/
+libri-chime-focus/
 
 ### Emacs ###
 # -*- mode: gitignore; -*-
