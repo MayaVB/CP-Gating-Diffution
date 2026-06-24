@@ -2610,6 +2610,99 @@ def gate_step_emd_p9010(step_info: dict, cache: dict) -> float:
     PX = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
     return _envelope_mod_depth_score(PX, method="p9010", eps=eps)
 
+
+def _spp_paul_score(SPP_y: np.ndarray, PX: np.ndarray, eps: float = 1e-8) -> float:
+    """SPP-Paul gating score. Higher = better.
+
+    Replaces IMCRA's PH1 with spp_paul's learned SPP mask (computed on noisy y).
+    PX is the power spectrum of the latent waveform in spp_paul's STFT domain.
+    Both SPP_y and PX must be in spp_paul's TF domain [F_spp, T].
+
+    score = Σ SPP_y · PX / Σ (1 - SPP_y) · PX
+    """
+    T = min(SPP_y.shape[1], PX.shape[1])
+    SPP_y = SPP_y[:, :T]
+    PX    = PX[:, :T]
+    num = float(np.sum(SPP_y * PX))
+    den = float(np.sum((1.0 - SPP_y) * PX))
+    score = num / (den + eps)
+    return score if np.isfinite(score) else 0.0
+
+
+def gate_step_oracle_spp(step_info: dict, cache: dict) -> float:
+    """Oracle SPP gate — requires clean reference. Higher = better.
+
+    oracle_SPP(f,t) = clip(PS(f,t) / (PY(f,t) + eps), 0, 1)
+    where PS = clean power spectrum, PY = noisy power spectrum,
+    both in SGMSE's TF domain (same grid as xt_mean — no interpolation).
+
+    score = Σ oracle_SPP · PX / Σ (1 - oracle_SPP) · PX
+
+    Validity check: if this doesn't improve on baseline, the score formula
+    is wrong regardless of SPP source. If it works, spp_paul quality is
+    the only remaining bottleneck.
+
+    cache keys required:
+        oracle_spp : np.ndarray [F, T] — clip(PS/PY, 0, 1), precomputed per file
+    cache keys optional:
+        eps        : float (default 1e-8)
+    """
+    xt_mean    = step_info["xt_mean"]
+    oracle_spp = cache["oracle_spp"]
+    eps        = cache.get("eps", 1e-8)
+
+    PX = (xt_mean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()  # [F, T]
+
+    T = min(PX.shape[1], oracle_spp.shape[1])
+    PX         = PX[:, :T]
+    oracle_spp = oracle_spp[:, :T]
+
+    num   = float(np.sum(oracle_spp * PX))
+    den   = float(np.sum((1.0 - oracle_spp) * PX))
+    score = num / (den + eps)
+    return score if np.isfinite(score) else 0.0
+
+
+def gate_step_spp_paul(step_info: dict, cache: dict) -> float:
+    """Per-step SPP-Paul gate. Higher = better.
+
+    SPP_y (speech presence probability from spp_paul on the noisy input y) is
+    computed once per file and stored in cache["spp_paul_spp"] [F_spp, T_spp].
+
+    Per try: xt_mean is converted to a waveform via model.to_audio (round-trip),
+    then spp_paul's STFT is applied to get PX in spp_paul's TF domain.  No neural
+    network inference per try — only one STFT.
+
+    cache keys required:
+        spp_paul_spp  : np.ndarray [F_spp, T_spp] — SPP from spp_paul(y), float32
+        spp_paul_model: spp_paul SPPEstimator instance (for its .stft attribute)
+        model         : ScoreModel (for model.to_audio)
+        T_orig        : int
+        norm_factor   : float
+    cache keys optional:
+        eps           : float (default 1e-8)
+    """
+    import torch
+
+    xt_mean     = step_info["xt_mean"]
+    model       = cache["model"]
+    T_orig      = cache["T_orig"]
+    norm_factor = cache["norm_factor"]
+    spp_model   = cache["spp_paul_model"]
+    SPP_y       = cache["spp_paul_spp"]
+    eps         = cache.get("eps", 1e-8)
+
+    # Round-trip: latent → waveform → spp_paul STFT → PX
+    wav = model.to_audio(xt_mean.squeeze(), T_orig) * norm_factor  # [T], on model device
+    wav_t = wav.unsqueeze(0)  # [1, T]
+    if spp_model.stft.window.device != wav_t.device:
+        spp_model.stft.window = spp_model.stft.window.to(wav_t.device)
+    with torch.no_grad():
+        stft = spp_model.stft.get_stft(wav_t)   # [1, F_spp, T_spp] complex
+    PX = stft.abs().pow(2).squeeze(0).cpu().numpy()  # [F_spp, T_spp]
+
+    return _spp_paul_score(SPP_y, PX, eps=eps)
+
 # (LTSV and global_mod_ratio removed after empirical evaluation on dns_noreverb:
 #  both underperformed logvar/emd_p9010.  LTSV failed due to near-eps channel
 #  instability; global_mod_ratio failed because DNS noise collapses modulation
@@ -2687,6 +2780,10 @@ def compute_gate_scores_per_step(step_info: dict, cache: dict, gates: list) -> d
             scores["logvar"] = gate_step_logvar(step_info, cache)
         elif gate == "emd_p9010":
             scores["emd_p9010"] = gate_step_emd_p9010(step_info, cache)
+        elif gate == "spp_paul":
+            scores["spp_paul"] = gate_step_spp_paul(step_info, cache)
+        elif gate == "oracle_spp":
+            scores["oracle_spp"] = gate_step_oracle_spp(step_info, cache)
     return scores
 
 

@@ -524,7 +524,8 @@ def _run_latent_gate_sampling(
     Two top-level policies, selected by latent_gate_policy:
 
     "best_of_k" (default — existing behavior):
-      Runs a fixed batch of tries and returns the one with the lowest score.
+      Runs a fixed batch of tries and returns the best-scoring one (highest for
+      higher-is-better scores like logvar/spp_paul/omlsa_gating; lowest otherwise).
       K-selection sub-policy (in priority order):
         1. Multi-level  (mid_omlsa_k_levels + mid_omlsa_tau_levels set):
              d0 mapped to k_target via tau_levels; runs tries 0..k_target-1.
@@ -594,8 +595,28 @@ def _run_latent_gate_sampling(
         from utils.speech_gate import gate_step_logvar as _gate_fn
     elif latent_gate_score == "emd_p9010":
         from utils.speech_gate import gate_step_emd_p9010 as _gate_fn
+    elif latent_gate_score == "spp_paul":
+        from utils.speech_gate import gate_step_spp_paul as _gate_fn
+    elif latent_gate_score == "oracle_spp":
+        from utils.speech_gate import gate_step_oracle_spp as _gate_fn
+    elif latent_gate_score == "traj_jump":
+        from utils.speech_gate import gate_step_traj_jump as _gate_fn
+    elif latent_gate_score == "pred_jump":
+        from utils.speech_gate import gate_step_pred_jump as _gate_fn
+    elif latent_gate_score == "traj_curvature":
+        from utils.speech_gate import gate_step_traj_curvature as _gate_fn
     else:
         raise ValueError(f"Unknown latent_gate_score: {latent_gate_score!r}")
+
+    # Trajectory scores run at every step and store their aggregate in the cache.
+    # The final score is read from cache at the gate step rather than returned directly.
+    _TRAJ_SCORE_KEYS = {
+        "traj_jump":      "_traj_jump_max_score",
+        "pred_jump":      "_pred_jump_max_score",
+        "traj_curvature": "_traj_curv_max_score",
+    }
+    _traj_cache_key = _TRAJ_SCORE_KEYS.get(latent_gate_score, None)
+    _is_trajectory_score = _traj_cache_key is not None
 
     def _run_try(t, _xt_box=None):
         """Run one diffusion try, return (x_hat, score).
@@ -608,11 +629,19 @@ def _run_latent_gate_sampling(
         _score_box = [None]
 
         def _step_cb(_si, _sb=_score_box, _cache=gate_cache, _target=latent_gate_step,
-                     _xt=_xt_box):
-            if _si["step_idx"] == _target:
-                _sb[0] = _gate_fn(_si, _cache)
-                if _xt is not None:
-                    _xt[0] = _si["xt_mean"][0].detach().cpu().numpy()  # complex64 [C, F, T]
+                     _xt=_xt_box, _is_traj=_is_trajectory_score, _tkey=_traj_cache_key):
+            if _is_traj:
+                # Trajectory scores must be called at every step to accumulate state.
+                _gate_fn(_si, _cache)
+                if _si["step_idx"] == _target:
+                    _sb[0] = _cache.get(_tkey, float("inf"))
+                    if _xt is not None:
+                        _xt[0] = _si["xt_mean"][0].detach().cpu().numpy()
+            else:
+                if _si["step_idx"] == _target:
+                    _sb[0] = _gate_fn(_si, _cache)
+                    if _xt is not None:
+                        _xt[0] = _si["xt_mean"][0].detach().cpu().numpy()  # complex64 [C, F, T]
 
         if base_seed is not None:
             _set_seeds(base_seed + t)
@@ -679,6 +708,15 @@ def _run_latent_gate_sampling(
     # -----------------------------------------------------------------------
     # Policy: best_of_k (existing behavior)
     # -----------------------------------------------------------------------
+    # Scores where higher value = better output (pick argmax).
+    # All others: lower = better (pick argmin).
+    _HIGHER_IS_BETTER_SCORES = {
+        "omlsa_gating", "omlsa_mix", "omlsa_mask_agree", "omlsa_residual_consistency",
+        "omlsa_enhanced_dominant", "omlsa_enhanced_total_dominant", "relative_omlsa",
+        "logvar", "emd_p9010", "spp_paul", "oracle_spp",
+    }
+    _higher_is_better = latent_gate_score in _HIGHER_IS_BETTER_SCORES
+
     # Save all tries when save_latents_dir is set (multi-try cache, _try{t} suffix).
     # Falls back to single-file naming (no suffix) when kmax==1 for compat.
     _save_all = save_latents_dir is not None
@@ -695,15 +733,18 @@ def _run_latent_gate_sampling(
 
     # --- Determine k_target ---
     if mid_omlsa_k_levels is not None:
-        # Multi-level policy
+        # Multi-level policy (lower-is-better only)
         k_target = mid_omlsa_k_levels[-1]
         for tau, k in zip(mid_omlsa_tau_levels, mid_omlsa_k_levels):
             if d0 <= tau:
                 k_target = k
                 break
     elif latent_gate_threshold is not None:
-        # Binary gating
-        k_target = 1 if d0 <= latent_gate_threshold else latent_gate_kmax
+        # Binary gating: already-good score → skip extra tries
+        if _higher_is_better:
+            k_target = 1 if d0 >= latent_gate_threshold else latent_gate_kmax
+        else:
+            k_target = 1 if d0 <= latent_gate_threshold else latent_gate_kmax
     else:
         # Offline mode: always run all tries
         k_target = latent_gate_kmax
@@ -715,7 +756,7 @@ def _run_latent_gate_sampling(
         _save_latent_cache(save_latents_dir, save_latents_filename, _xt_box_t, gate_cache,
                            try_idx=_t if _save_all and latent_gate_kmax > 1 else None)
         scores.append(score)
-        if score < best_score:
+        if (_higher_is_better and score > best_score) or (not _higher_is_better and score < best_score):
             best_score = score
             best_x_hat = x_hat_t
             chosen_try = _t
@@ -808,7 +849,7 @@ if __name__ == '__main__':
     parser.add_argument("--latent_gate_max_retries", type=int, default=10,
                         help="Max additional retries after try 0 for sequential_threshold policy "
                              "(total max samples = 1 + latent_gate_max_retries; default: 10)")
-    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_gating", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant", "relative_omlsa", "logvar", "emd_p9010"],
+    parser.add_argument("--latent_gate_score", choices=["wiener_residual", "wiener_tf", "omlsa_residual", "omlsa_residual_tf", "omlsa_gating", "omlsa_mix", "omlsa_mask_agree", "omlsa_enhanced_dominant", "relative_omlsa", "logvar", "emd_p9010", "spp_paul", "oracle_spp", "traj_jump", "pred_jump", "traj_curvature"],
                         default="wiener_residual",
                         help="Mid-step scoring function: 'wiener_residual' (default) uses static median noise; "
                              "'wiener_tf' uses IMCRA adaptive noise tracking on model-domain PY (no waveform conversion); "
@@ -818,6 +859,14 @@ if __name__ == '__main__':
                              "'omlsa_gating' same backbone, simplified score: residual-noise / preserved-speech energy ratio; "
                              "'logvar' GLEMD via variance — Var(log(Σ_k PX(k,l))); higher=better, no PY/IMCRA; "
                              "'emd_p9010' GLEMD via P90-P10 contrast — same grounding as logvar, more outlier-robust.")
+    parser.add_argument("--oracle_clean_dir", type=str, default=None,
+                        metavar="DIR",
+                        help="Path to clean reference wavs (required when --latent_gate_score oracle_spp). "
+                             "Filenames must match --test_dir. Used only for oracle ceiling experiments.")
+    parser.add_argument("--spp_paul_checkpoint", type=str, default=None,
+                        metavar="CKPT",
+                        help="Path to spp_paul checkpoint (required when --latent_gate_score spp_paul). "
+                             "Use spp_paul/spp/saved/16khz/epoch=48-step=441000.ckpt for 16 kHz.")
     parser.add_argument("--latent_gate_save_latents", type=str, default=None,
                         metavar="DIR",
                         help="If set, save per-file latent cache (PX, PY as .npz) to DIR after try 0. "
@@ -942,6 +991,21 @@ if __name__ == '__main__':
     model = ScoreModel.load_from_checkpoint(args.ckpt, map_location=args.device)
     model.t_eps = args.t_eps
     model.eval()
+
+    # Load spp_paul model once if needed
+    _spp_paul_model = None
+    if getattr(args, "latent_gate_score", None) == "spp_paul":
+        if not args.spp_paul_checkpoint:
+            raise ValueError("--spp_paul_checkpoint is required when --latent_gate_score spp_paul")
+        import sys as _sys
+        _spp_paul_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spp_paul")
+        if _spp_paul_dir not in _sys.path:
+            _sys.path.insert(0, _spp_paul_dir)
+        from spp.models.spp_tcn import SPPEstimator
+        _spp_paul_model = SPPEstimator.load_from_checkpoint(
+            args.spp_paul_checkpoint, map_location=args.device
+        )
+        _spp_paul_model.eval()
 
     # Generic step-snapshot feature (--save_steps_all / --save_steps_limit)
     _save_steps_set = {int(s.strip()) for s in args.save_steps.split(',') if s.strip()}
@@ -1130,6 +1194,32 @@ if __name__ == '__main__':
                 # Y[0] is [C, F, T_spec]; sum over channels → [F, T_spec].
                 # This is the exact same TF grid as xt_mean, so no STFT mismatch.
                 _lg_cache["y_PY"] = (Y[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+            elif args.latent_gate_score == "oracle_spp":
+                if not args.oracle_clean_dir:
+                    raise ValueError("--oracle_clean_dir is required when --latent_gate_score oracle_spp")
+                _clean_file = os.path.join(args.oracle_clean_dir, filename)
+                _x_clean, _sr_clean = load(_clean_file)
+                if _sr_clean != target_sr:
+                    _x_clean = torch.tensor(resample(_x_clean.numpy(), orig_sr=_sr_clean, target_sr=target_sr))
+                _x_clean = _x_clean / norm_factor  # same scale as y
+                _X_clean = torch.unsqueeze(model._forward_transform(model._stft(_x_clean.to(args.device))), 0)
+                _X_clean = pad_spec(_X_clean, mode=pad_mode)
+                _PS = (_X_clean[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+                _y_PY = (Y[0].abs() ** 2).sum(dim=0).detach().cpu().numpy()
+                _lg_cache["oracle_spp"] = np.clip(_PS / (_y_PY + 1e-8), 0.0, 1.0)
+            elif args.latent_gate_score == "spp_paul":
+                import torch as _torch
+                _lg_cache["model"]        = model
+                _lg_cache["T_orig"]       = T_orig
+                _lg_cache["norm_factor"]  = norm_factor
+                _lg_cache["spp_paul_model"] = _spp_paul_model
+                # Compute SPP_y from noisy waveform once per file
+                _y_wav = y.squeeze().float()                       # [T]
+                _rms   = _y_wav.pow(2).mean().sqrt().clamp(min=1e-8)
+                _y_in  = (0.1 * _y_wav / _rms).unsqueeze(0).to(args.device)  # [1, T]
+                with _torch.no_grad():
+                    _spp_out = _spp_paul_model({"input": _y_in})
+                _lg_cache["spp_paul_spp"] = _spp_out["spp_estimate"].squeeze(0).cpu().numpy()  # [F_spp, T_spp]
             _lg_base_seed = (args.gate_seed + 1000 * _utt_idx) if args.gate_seed is not None else None
             (x_hat,
              _lg_scores,
